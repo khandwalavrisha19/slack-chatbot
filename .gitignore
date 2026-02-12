@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets
+.env
+*.env
+
+# Node / Frontend / CDK
+node_modules/
+.next/
+cdk.out/
+
+# OS
+.DS_Store
+Thumbs.db

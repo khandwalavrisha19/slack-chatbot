@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Connect Slack</title>
+  <style>
+    body { font-family: Arial, sans-serif; display:flex; min-height:100vh; align-items:center; justify-content:center; background:#0b1220; color:#fff; }
+    .card { width: 420px; padding: 28px; border-radius: 14px; background:#111a2e; box-shadow: 0 12px 30px rgba(0,0,0,.35); }
+    h1 { margin:0 0 10px; font-size: 22px; }
+    p { margin:0 0 18px; opacity:.85; line-height:1.4; }
+    input { width:100%; padding:12px; border-radius:10px; border:1px solid #2b375a; background:#0b1220; color:#fff; margin-bottom:14px; }
+    button { width:100%; padding:12px; border:none; border-radius:10px; background:#2ea44f; color:#fff; font-weight:700; cursor:pointer; font-size: 15px; }
+    button:hover { filter: brightness(1.05); }
+    .hint { margin-top:10px; font-size:12px; opacity:.75; }
+    code { background:#0b1220; padding:2px 6px; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Connect your Slack Workspace</h1>
+    <p>Click below to authorize Slack and connect your workspace to the bot.</p>
+
+    <label for="apiBase">Backend Base URL</label>
+    <input
+  id="apiBase"
+  value="https://fcemnui289.execute-api.ap-south-1.amazonaws.com"
+  placeholder="https://fcemnui289.execute-api.ap-south-1.amazonaws.com"
+/>
+
+    <button id="connectBtn">Connect Slack</button>
+
+    
+  </div>
+
+  <script>
+    document.getElementById("connectBtn").addEventListener("click", () => {
+      const apiBase = document.getElementById("apiBase").value.trim().replace(/\/$/, "");
+      if (!apiBase) {
+        alert("Please enter your Backend Base URL.");
+        return;
+      }
+      // Redirect user to backend OAuth start endpoint
+      window.location.href = `${apiBase}/install`;
+    });
+  </script>
+</body>
+</html>
