@@ -27,30 +27,44 @@ jobs:
         shell: bash
         run: |
           if [ "${GITHUB_REF_NAME}" = "develop" ]; then
-            echo "ENV_NAME=dev" >> "$GITHUB_ENV"
-            echo "STACK_NAME=dev-slackbot-stack" >> "$GITHUB_ENV"
-            echo "ROLE_ARN=${{ secrets.AWS_DEPLOY_ROLE_ARN_DEV }}" >> "$GITHUB_ENV"
-            echo "SLACK_CLIENT_ID=${{ secrets.DEV_SLACK_CLIENT_ID }}" >> "$GITHUB_ENV"
-            echo "SLACK_CLIENT_SECRET=${{ secrets.DEV_SLACK_CLIENT_SECRET }}" >> "$GITHUB_ENV"
-            echo "SLACK_SIGNING_SECRET=${{ secrets.DEV_SLACK_SIGNING_SECRET }}" >> "$GITHUB_ENV"
-            echo "GROQ_API_KEY=${{ secrets.DEV_GROQ_API_KEY }}" >> "$GITHUB_ENV"
-            echo "API_DOMAIN=${{ secrets.DEV_API_DOMAIN }}" >> "$GITHUB_ENV"
+            ENV_NAME="dev"
+            STACK_NAME="dev-slackbot-stack"
+            ROLE_ARN="${{ secrets.AWS_DEPLOY_ROLE_ARN_DEV }}"
+            SLACK_CLIENT_ID="${{ secrets.DEV_SLACK_CLIENT_ID }}"
+            SLACK_CLIENT_SECRET="${{ secrets.DEV_SLACK_CLIENT_SECRET }}"
+            SLACK_SIGNING_SECRET="${{ secrets.DEV_SLACK_SIGNING_SECRET }}"
+            GROQ_API_KEY="${{ secrets.DEV_GROQ_API_KEY }}"
+            API_DOMAIN="${{ secrets.DEV_API_DOMAIN }}"
           elif [ "${GITHUB_REF_NAME}" = "main" ]; then
-            echo "ENV_NAME=prod" >> "$GITHUB_ENV"
-            echo "STACK_NAME=prod-slackbot-stack" >> "$GITHUB_ENV"
-            echo "ROLE_ARN=${{ secrets.AWS_DEPLOY_ROLE_ARN_PROD }}" >> "$GITHUB_ENV"
-            echo "SLACK_CLIENT_ID=${{ secrets.PROD_SLACK_CLIENT_ID }}" >> "$GITHUB_ENV"
-            echo "SLACK_CLIENT_SECRET=${{ secrets.PROD_SLACK_CLIENT_SECRET }}" >> "$GITHUB_ENV"
-            echo "SLACK_SIGNING_SECRET=${{ secrets.PROD_SLACK_SIGNING_SECRET }}" >> "$GITHUB_ENV"
-            echo "GROQ_API_KEY=${{ secrets.PROD_GROQ_API_KEY }}" >> "$GITHUB_ENV"
-            echo "API_DOMAIN=${{ secrets.PROD_API_DOMAIN }}" >> "$GITHUB_ENV"
+            ENV_NAME="prod"
+            STACK_NAME="prod-slackbot-stack"
+            ROLE_ARN="${{ secrets.AWS_DEPLOY_ROLE_ARN_PROD }}"
+            SLACK_CLIENT_ID="${{ secrets.PROD_SLACK_CLIENT_ID }}"
+            SLACK_CLIENT_SECRET="${{ secrets.PROD_SLACK_CLIENT_SECRET }}"
+            SLACK_SIGNING_SECRET="${{ secrets.PROD_SLACK_SIGNING_SECRET }}"
+            GROQ_API_KEY="${{ secrets.PROD_GROQ_API_KEY }}"
+            API_DOMAIN="${{ secrets.PROD_API_DOMAIN }}"
           else
             echo "Unsupported branch: ${GITHUB_REF_NAME}"
             exit 1
           fi
 
           SHORT_SHA="$(echo "${GITHUB_SHA}" | cut -c1-7)"
-          echo "IMAGE_TAG=${ENV_NAME}-${SHORT_SHA}" >> "$GITHUB_ENV"
+          IMAGE_TAG="${ENV_NAME}-${SHORT_SHA}"
+
+          echo "ENV_NAME=$ENV_NAME" >> "$GITHUB_ENV"
+          echo "STACK_NAME=$STACK_NAME" >> "$GITHUB_ENV"
+          echo "ROLE_ARN=$ROLE_ARN" >> "$GITHUB_ENV"
+          echo "SLACK_CLIENT_ID=$SLACK_CLIENT_ID" >> "$GITHUB_ENV"
+          echo "SLACK_CLIENT_SECRET=$SLACK_CLIENT_SECRET" >> "$GITHUB_ENV"
+          echo "SLACK_SIGNING_SECRET=$SLACK_SIGNING_SECRET" >> "$GITHUB_ENV"
+          echo "GROQ_API_KEY=$GROQ_API_KEY" >> "$GITHUB_ENV"
+          echo "API_DOMAIN=$API_DOMAIN" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+
+          echo "Using ENV_NAME=$ENV_NAME"
+          echo "Using STACK_NAME=$STACK_NAME"
+          echo "Using IMAGE_TAG=$IMAGE_TAG"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
