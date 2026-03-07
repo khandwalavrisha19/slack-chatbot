@@ -485,13 +485,36 @@
   // ── Connect Slack ─────────────────────────────────────────────────────────
   // OAuth opens in a new tab. When the user finishes and comes back to this
   // tab, the visibilitychange + focus listeners below reload workspaces.
-  let oauthPending = false;
+ let oauthPopup = null;
 
-  function connectSlack() {
-    setStatus("Waiting for Slack OAuth… (complete in the new tab)");
-    oauthPending = true;
-    window.open(getApiBase() + "/install", "_blank", "noopener,noreferrer");
+function connectSlack() {
+  setStatus("Opening Slack OAuth…");
+  oauthPopup = window.open(
+    getApiBase() + "/install",
+    "slack_oauth_popup",
+    "width=700,height=800,menubar=no,toolbar=no,location=yes,resizable=yes,scrollbars=yes,status=no"
+  );
+
+  if (!oauthPopup) {
+    setStatus("Popup blocked. Please allow popups.", "err");
+    return;
   }
+}
+
+window.addEventListener("message", async (event) => {
+  const data = event.data || {};
+
+  if (data.type === "slack_oauth_success") {
+    setStatus("Workspace connected", "ok");
+    await loadWorkspaces(data.team_id);
+    return;
+  }
+
+  if (data.type === "slack_oauth_error") {
+    show({ ok: false, oauth_error: data.error });
+    setStatus("Slack connect failed", "err");
+  }
+});
 
   // Fires when the user switches back to this tab (works on all browsers)
   document.addEventListener("visibilitychange", () => {
@@ -511,41 +534,70 @@
     loadWorkspaces();
   });
 
-  // ── Load Workspaces (session-scoped) ─────────────────────────────────────
-  async function loadWorkspaces(){
-    try{
-      setStatus("Loading workspaces…");
-      const r = await fetch(getApiBase() + "/workspaces");
-      const data = await safeJson(r);
-      show(data);
-      const sel = document.getElementById("workspaceSelect");
-      sel.innerHTML = "";
-      const list = data.workspaces || [];
-      if (!data.ok) {
-        sel.innerHTML = '<option value="">— failed to load workspaces —</option>';
-        setStatus("Workspaces load failed", "err");
-        return;
-      }
-      if (list.length === 0) {
-        sel.innerHTML = '<option value="">— none connected yet —</option>';
-        setStatus("No workspaces connected");
-        return;
-      }
-      const last = localStorage.getItem("LAST_TEAM_ID") || "";
-      list.forEach(w => {
-        const opt = document.createElement("option");
-        opt.value = w.team_id;
-        opt.textContent = w.team_id + (w.team_name ? (" • " + w.team_name) : "");
-        if (w.team_id === last) opt.selected = true;
-        sel.appendChild(opt);
-      });
-      setStatus("Workspaces loaded", "ok");
-      if (sel.value) loadChannels();
-    }catch(e){
-      show({ ok:false, error:String(e) });
+async function loadWorkspaces(preferredTeamId = "") {
+  try {
+    setStatus("Loading workspaces…");
+
+    const r = await fetch(getApiBase() + "/workspaces", {
+      credentials: "include"
+    });
+    const data = await safeJson(r);
+    show(data);
+
+    const sel = document.getElementById("workspaceSelect");
+    const chSel = document.getElementById("channelSelect");
+
+    sel.innerHTML = "";
+    chSel.innerHTML = '<option value="">— Load channels first —</option>';
+
+    if (!data.ok) {
+      sel.innerHTML = '<option value="">— failed to load workspaces —</option>';
       setStatus("Workspaces load failed", "err");
+      return;
     }
+
+    const list = data.workspaces || [];
+
+    if (list.length === 0) {
+      sel.innerHTML = '<option value="">— none connected yet —</option>';
+      setStatus("No workspaces connected");
+      return;
+    }
+
+    let selectedFound = false;
+
+    list.forEach((w, index) => {
+      const opt = document.createElement("option");
+      opt.value = w.team_id;
+      opt.textContent = w.team_id + (w.team_name ? (" • " + w.team_name) : "");
+
+      if (preferredTeamId && w.team_id === preferredTeamId) {
+        opt.selected = true;
+        selectedFound = true;
+      }
+
+      if (!preferredTeamId && index === 0) {
+        opt.selected = true;
+        selectedFound = true;
+      }
+
+      sel.appendChild(opt);
+    });
+
+    if (!selectedFound && sel.options.length > 0) {
+      sel.selectedIndex = 0;
+    }
+
+    setStatus("Workspaces loaded", "ok");
+
+    if (sel.value) {
+      await loadChannels();
+    }
+  } catch (e) {
+    show({ ok: false, error: String(e) });
+    setStatus("Workspaces load failed", "err");
   }
+}
 
   // ── Check Token ──────────────────────────────────────────────────────────
   async function checkToken() {
