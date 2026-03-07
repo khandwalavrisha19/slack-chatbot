@@ -367,8 +367,9 @@
 </div>
 
 <script>
+  // Derives API base from the current origin — works with S3+CloudFront or any custom domain
   function getApiBase(){
-    return location.pathname.startsWith("/api") ? location.origin : location.origin + "/api";
+    return window.location.origin + "/api";
   }
 
   function setStatus(msg, type){
@@ -376,7 +377,7 @@
     const p = document.getElementById("pill");
     s.textContent = msg;
     s.className = "status-bar" + (type ? " " + type : "");
-    p.textContent = msg.length > 24 ? msg.slice(0, 24) + "…" : msg;
+    p.textContent = msg.length > 24 ? msg.slice(0,24)+"…" : msg;
     p.className = "pill" + (type ? " " + type : "");
   }
 
@@ -384,7 +385,7 @@
     document.getElementById("out").textContent = JSON.stringify(obj, null, 2);
   }
 
- async function safeJson(r){
+  async function safeJson(r){
     const text = await r.text();
     try { return JSON.parse(text); } catch { return { ok:false, raw:text }; }
   }
@@ -406,32 +407,11 @@
     loadWorkspaces().catch(()=>{});
   })();
 
-  let oauthPopup = null;
-
-  async function connectSlack(){
+  // ---------- Actions ----------
+  function connectSlack(){
     setStatus("Opening Slack OAuth…");
-    oauthPopup = window.open(
-      getApiBase() + "/install",
-      "slack_oauth_popup",
-      "width=700,height=800,menubar=no,toolbar=no,location=yes,resizable=yes,scrollbars=yes,status=no"
-    );
-    if (!oauthPopup) {
-      setStatus("Popup blocked. Please allow popups.", "err");
-    }
+    window.open(getApiBase() + "/install", "_blank", "noopener,noreferrer");
   }
-
-  window.addEventListener("message", async (event) => {
-    const data = event.data || {};
-    if (data.type === "slack_oauth_success") {
-      setStatus("Workspace connected", "ok");
-      await loadWorkspaces(data.team_id || "");
-      return;
-    }
-    if (data.type === "slack_oauth_error") {
-      show({ ok:false, oauth_error:data.error });
-      setStatus("Slack connect failed", "err");
-    }
-  });
 
   async function loadWorkspaces(){
     try{
@@ -468,44 +448,40 @@
     }
   }
 
-
-  async function checkToken() {
-    try {
+  async function checkToken(){
+    try{
       const team_id = document.getElementById("workspaceSelect").value;
-      if (!team_id) { setStatus("Select a workspace first", "warn"); return; }
+      if(!team_id){ setStatus("Select a workspace first", "warn"); return; }
       setStatus("Checking token…");
       const r = await fetch(getApiBase() + "/token/status?team_id=" + encodeURIComponent(team_id));
       const data = await safeJson(r);
       show(data);
       if (data.ok && data.has_token) setStatus("Token OK", "ok");
       else setStatus("Token missing", "warn");
-    } catch (e) {
+    }catch(e){
       show({ ok:false, error:String(e) });
       setStatus("Token check failed", "err");
     }
   }
 
-  async function loadChannels() {
-    try {
+  async function loadChannels(){
+    try{
       const team_id = document.getElementById("workspaceSelect").value;
-      const sel = document.getElementById("channelSelect");
-      if (!team_id) {
-        sel.innerHTML = '<option value="">— Load channels first —</option>';
-        return;
-      }
+      if(!team_id) return;
       setStatus("Loading channels…");
       const r = await fetch(getApiBase() + "/channels?team_id=" + encodeURIComponent(team_id));
       const data = await safeJson(r);
       show(data);
+      const sel = document.getElementById("channelSelect");
       sel.innerHTML = "";
       if (!data.ok) {
-        sel.innerHTML = '<option value="">— Failed to load —</option>';
+        sel.innerHTML = '<option value="">— failed to load channels —</option>';
         setStatus("Channels load failed", "err");
         return;
       }
       const channels = data.channels || [];
-      if (!channels.length) {
-        sel.innerHTML = '<option value="">— No channels returned —</option>';
+      if (channels.length === 0) {
+        sel.innerHTML = '<option value="">— no channels returned —</option>';
         setStatus("No channels", "warn");
         return;
       }
@@ -516,222 +492,302 @@
         sel.appendChild(opt);
       });
       setStatus("Channels loaded", "ok");
-    } catch (e) {
+    }catch(e){
       show({ ok:false, error:String(e) });
       setStatus("Channels load failed", "err");
     }
   }
 
   async function backfillOneChannel(team_id, channel_id){
-    let cursor = "", totalStored = 0, pages = 0;
-    while (true) {
+    let cursor = "", totalStored = 0;
+    while (true){
       const url = getApiBase() + "/backfill-channel?team_id=" + encodeURIComponent(team_id) +
-        "&channel_id=" + encodeURIComponent(channel_id) +
-        "&limit=200" + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "");
-      const r = await fetch(url, { method: "POST" });
+        "&channel_id=" + encodeURIComponent(channel_id) + "&limit=200" +
+        (cursor ? "&cursor=" + encodeURIComponent(cursor) : "");
+      const r = await fetch(url, { method:"POST" });
       const data = await safeJson(r);
-      if (!data.ok) return data;
-      totalStored += data.stored_new || 0;
-      pages += 1;
+      if (!data.ok) return { ok:false, error:data };
+      totalStored += (data.stored_new || 0);
+      if (!data.has_more) break;
       cursor = data.next_cursor || "";
-      if (!cursor) return { ok:true, stored: totalStored, pages };
       await new Promise(res => setTimeout(res, 350));
     }
+    return { ok:true, stored: totalStored };
   }
 
   async function joinSelectedAndBackfill(){
-    try {
+    try{
       const team_id = document.getElementById("workspaceSelect").value;
       const channel_id = document.getElementById("channelSelect").value;
-      if (!team_id || !channel_id) { setStatus("Select workspace + channel first", "warn"); return; }
-      setStatus("Joining selected channel…");
-      const r = await fetch(getApiBase() + "/join-channel?team_id=" + encodeURIComponent(team_id) + "&channel_id=" + encodeURIComponent(channel_id), { method:"POST" });
+      if(!team_id || !channel_id){ setStatus("Select workspace + channel first", "warn"); return; }
+      setStatus("Joining channel…");
+      const r = await fetch(getApiBase() + "/join-channel?team_id=" + encodeURIComponent(team_id) +
+        "&channel_id=" + encodeURIComponent(channel_id), { method:"POST" });
       const j = await safeJson(r);
-      if (!j.ok) { show(j); setStatus("Join failed", "err"); return; }
-      setStatus("Backfilling selected channel…");
+      if(!j.ok){ show(j); setStatus("Join failed", "err"); return; }
+      setStatus("Backfilling…");
       const bf = await backfillOneChannel(team_id, channel_id);
-      show({ join:j, backfill:bf });
+      show({ join: j, backfill: bf });
       if (bf.ok) setStatus("Done — " + bf.stored + " stored", "ok");
       else setStatus("Backfill failed", "err");
-    } catch (e) {
+    }catch(e){
       show({ ok:false, error:String(e) });
       setStatus("Failed", "err");
     }
   }
 
   async function joinAllAndBackfill(){
-    try {
+    try{
       const team_id = document.getElementById("workspaceSelect").value;
-      if (!team_id) { setStatus("Select a workspace first", "warn"); return; }
+      if(!team_id){ setStatus("Select a workspace first", "warn"); return; }
       setStatus("Joining all public channels…");
       const r = await fetch(getApiBase() + "/join-all-public?team_id=" + encodeURIComponent(team_id), { method:"POST" });
       const j = await safeJson(r);
-      if (!j.ok) { show(j); setStatus("Join-all failed", "err"); return; }
-
-      await loadChannels();
+      if(!j.ok){ show(j); setStatus("Join-all failed", "err"); return; }
       const sel = document.getElementById("channelSelect");
-      const channelIds = Array.from(sel.options).map(o => o.value).filter(Boolean);
-      if (!channelIds.length) { show(j); setStatus("No channels loaded", "warn"); return; }
-
-      let total = 0;
-      const results = [];
-      for (let i = 0; i < channelIds.length; i++) {
-        setStatus(`Backfilling ${i + 1}/${channelIds.length}…`);
+      const channelIds = Array.from(sel.options).map(o => o.value).filter(v => v);
+      if(!channelIds.length){ show(j); setStatus("No channels loaded", "warn"); return; }
+      let total = 0, results = [];
+      for (let i = 0; i < channelIds.length; i++){
+        setStatus(`Backfilling ${i+1}/${channelIds.length}…`);
         const bf = await backfillOneChannel(team_id, channelIds[i]);
-        results.push({ channel: channelIds[i], backfill: bf });
-        if (bf.ok) total += bf.stored || 0;
-        await new Promise(res => setTimeout(res, 300));
+        results.push({ channel: channelIds[i], ...bf });
+        if (bf.ok) total += bf.stored;
+        await new Promise(res => setTimeout(res, 400));
       }
-      show({ join_all:j, backfill_all:{ total_stored: total, results } });
+      show({ join_all: j, backfill_all: { total_stored: total, results }});
       setStatus("Done — " + total + " total stored", "ok");
-    } catch (e) {
+    }catch(e){
       show({ ok:false, error:String(e) });
       setStatus("Failed", "err");
     }
   }
 
   async function loadMessagesFromDB(){
-    try {
+    try{
       const team_id = document.getElementById("workspaceSelect").value;
       const channel_id = document.getElementById("channelSelect").value;
-      if (!team_id || !channel_id) { setStatus("Select workspace + channel first", "warn"); return; }
+      if(!team_id || !channel_id){ setStatus("Select workspace + channel first", "warn"); return; }
       setStatus("Loading from DB…");
-      const url = getApiBase() + "/db-messages?team_id=" + encodeURIComponent(team_id) + "&channel_id=" + encodeURIComponent(channel_id) + "&limit=50";
+      const url = getApiBase() + "/db-messages?team_id=" + encodeURIComponent(team_id) +
+        "&channel_id=" + encodeURIComponent(channel_id) + "&limit=50";
       const r = await fetch(url);
       const data = await safeJson(r);
       show(data);
       if (data.ok) setStatus("Loaded from DB", "ok");
       else setStatus("DB load failed", "err");
-    } catch (e) {
+    }catch(e){
       show({ ok:false, error:String(e) });
       setStatus("DB load failed", "err");
     }
   }
 
   async function disconnectWorkspace(){
-    try {
-      const sel = document.getElementById("workspaceSelect");
-      const chSel = document.getElementById("channelSelect");
-      const team_id = sel.value;
-      if (!team_id) { setStatus("Select a workspace first", "warn"); return; }
-      if (!confirm("Disconnect this workspace? This will revoke the token and delete the secret.")) return;
+    try{
+      const team_id = document.getElementById("workspaceSelect").value;
+      if(!team_id) return;
+      if(!confirm("Disconnect this workspace? This will revoke the token and delete the secret.")) return;
       setStatus("Disconnecting…");
       const r = await fetch(getApiBase() + "/workspaces/" + encodeURIComponent(team_id), { method:"DELETE" });
       const data = await safeJson(r);
       show(data);
-      if (!data.ok) {
-        setStatus("Disconnect failed", "err");
-        return;
-      }
-      sel.innerHTML = '<option value="">— none connected yet —</option>';
-      chSel.innerHTML = '<option value="">— Load channels first —</option>';
       setStatus("Disconnected", "ok");
       await loadWorkspaces();
-      window.location.reload();
-    } catch (e) {
+    }catch(e){
       show({ ok:false, error:String(e) });
       setStatus("Disconnect failed", "err");
     }
   }
 
-  function clearSearch(){
-    document.getElementById("keyword").value = "";
-    document.getElementById("fromDate").value = "";
-    document.getElementById("toDate").value = "";
-    document.getElementById("searchUserId").value = "";
-    setStatus("Search cleared");
-  }
-
+  // ── Search ────────────────────────────────────────────────────────────────
   async function searchMessages(){
     try {
-      const team_id = document.getElementById("workspaceSelect").value;
+      const team_id    = document.getElementById("workspaceSelect").value;
       const channel_id = document.getElementById("channelSelect").value;
       if (!team_id || !channel_id) { setStatus("Select workspace + channel first", "warn"); return; }
-      const q = document.getElementById("keyword").value.trim();
-      const from = document.getElementById("fromDate").value;
-      const to = document.getElementById("toDate").value;
+
+      const q       = document.getElementById("keyword").value.trim();
+      const from    = document.getElementById("fromDate").value;
+      const to      = document.getElementById("toDate").value;
       const user_id = document.getElementById("searchUserId").value.trim();
 
-      const params = new URLSearchParams({ team_id, channel_id, limit: "200", top_k: "10" });
-      if (q) params.set("q", q);
-      if (from) params.set("from", from);
-      if (to) params.set("to", to);
-      if (user_id) params.set("user_id", user_id);
+      let url = getApiBase() + "/search"
+        + "?team_id="    + encodeURIComponent(team_id)
+        + "&channel_id=" + encodeURIComponent(channel_id);
+      if (q)       url += "&q="       + encodeURIComponent(q);
+      if (from)    url += "&from="    + encodeURIComponent(from);
+      if (to)      url += "&to="      + encodeURIComponent(to);
+      if (user_id) url += "&user_id=" + encodeURIComponent(user_id);
 
       setStatus("Searching…");
-      const r = await fetch(getApiBase() + "/search?" + params.toString());
+      const r    = await fetch(url);
       const data = await safeJson(r);
       show(data);
-      if (data.ok) setStatus("Search complete", "ok");
-      else setStatus("Search failed", "err");
-    } catch (e) {
-      show({ ok:false, error:String(e) });
-      setStatus("Search failed", "err");
+
+      if (data.ok) {
+        const n = data.count || 0;
+        setStatus(n > 0 ? `Found ${n} message${n===1?"":"s"}` : "No results found", n > 0 ? "ok" : "warn");
+      } else {
+        setStatus("Search failed", "err");
+      }
+    } catch(e) {
+      show({ ok:false, error: String(e) });
+      setStatus("Search error", "err");
     }
   }
 
+  function clearSearch(){
+    document.getElementById("keyword").value     = "";
+    document.getElementById("fromDate").value    = "";
+    document.getElementById("toDate").value      = "";
+    document.getElementById("searchUserId").value = "";
+    show({});
+    setStatus("Cleared");
+  }
+
+  // ── Chat (Day 2 — endpoint wired, shows helpful message until backend ready) ─
   async function askChat(){
     try {
-      const team_id = document.getElementById("workspaceSelect").value;
+      const team_id    = document.getElementById("workspaceSelect").value;
       const channel_id = document.getElementById("channelSelect").value;
-      const question = document.getElementById("chatQuestion").value.trim();
+      const question   = document.getElementById("chatQuestion").value.trim();
+
       if (!team_id || !channel_id) { setStatus("Select workspace + channel first", "warn"); return; }
-      if (!question) { setStatus("Enter a question first", "warn"); return; }
+      if (!question)               { setStatus("Enter a question first", "warn"); return; }
+      if (question.length > 500)   { setStatus("Question too long (max 500 chars)", "warn"); return; }
 
-      const body = {
-        team_id,
-        channel_id,
-        question,
-        from_date: document.getElementById("fromDate").value || null,
-        to_date: document.getElementById("toDate").value || null,
-        user_id: document.getElementById("searchUserId").value.trim() || null,
-        top_k: 10,
-      };
+      const btn = document.getElementById("askBtn");
+      btn.disabled   = true;
+      btn.textContent = "Asking…";
+      document.getElementById("chatAnswer").style.display = "none";
+      setStatus("Thinking…");
 
-      setStatus("Asking AI…");
-      document.getElementById("askBtn").disabled = true;
       const r = await fetch(getApiBase() + "/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ team_id, channel_id, question }),
       });
       const data = await safeJson(r);
       show(data);
 
-      const box = document.getElementById("chatAnswer");
-      const text = document.getElementById("chatAnswerText");
-      const cites = document.getElementById("chatCitations");
+      if (data.ok && data.answer) {
+        // ── Parse + render answer ─────────────────────────────────
+        var raw = data.answer || "";
 
-      if (!data.ok) {
-        box.style.display = "block";
-        text.textContent = data.detail || data.error || "Chat failed";
-        cites.innerHTML = "";
-        setStatus("AI failed", "err");
-        return;
+        // Simple line-by-line section parser — no complex regex
+        function parseSection(text, label) {
+          var lines = text.split("\n");
+          var collecting = false;
+          var result = [];
+          var allLabels = ["answer","key points","action items","citations"];
+          for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            var lineLower = line.toLowerCase();
+            var startsWithLabel = allLabels.some(function(l){ return lineLower.startsWith(l + ":"); });
+            if (lineLower.startsWith(label.toLowerCase() + ":")) {
+              collecting = true;
+              var rest = line.substring(line.indexOf(":") + 1).trim();
+              if (rest) result.push(rest);
+            } else if (collecting && startsWithLabel) {
+              break;
+            } else if (collecting) {
+              result.push(line);
+            }
+          }
+          return result.join("\n").trim();
+        }
+
+        function esc(s) {
+          return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+        }
+
+        var answerText  = parseSection(raw, "Answer") || raw;
+        var keyPoints   = parseSection(raw, "Key points");
+        var actionItems = parseSection(raw, "Action items");
+
+        var html = '<div style="font-size:13px;color:var(--text);line-height:1.7;">'
+          + esc(answerText).split("\n").join("<br>") + '</div>';
+
+        if (keyPoints && keyPoints.toLowerCase() !== "none" && keyPoints.trim() !== "") {
+          var bullets = keyPoints.split("\n")
+            .map(function(b){ return b.replace(/^[\*\-]\s*/,"").trim(); })
+            .filter(function(b){ return b.length > 0; });
+          html += '<div style="margin-top:12px;">'
+            + '<div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px;">Key Points</div>';
+          for (var i=0; i<bullets.length; i++) {
+            html += '<div style="display:flex;gap:6px;margin-bottom:4px;font-size:13px;color:var(--text-soft);">'
+              + '<span style="color:var(--accent);flex-shrink:0;">&#xB7;</span>'
+              + '<span>' + esc(bullets[i]) + '</span></div>';
+          }
+          html += '</div>';
+        }
+
+        if (actionItems && actionItems.toLowerCase() !== "none" && actionItems.trim() !== "") {
+          html += '<div style="margin-top:12px;padding:8px 12px;border-radius:6px;'
+            + 'background:rgba(155,127,232,0.07);border:1px solid rgba(155,127,232,0.15);">'
+            + '<div style="font-size:11px;font-weight:600;color:var(--accent);text-transform:uppercase;'
+            + 'letter-spacing:.04em;margin-bottom:4px;">Action Items</div>'
+            + '<div style="font-size:13px;color:var(--text-soft);">'
+            + esc(actionItems).split("\n").join("<br>") + '</div></div>';
+        }
+
+        document.getElementById("chatAnswerText").innerHTML = html;
+        // ── Render citations ───────────────────────────────────────
+        const citBox = document.getElementById("chatCitations");
+        if (data.citations && data.citations.length > 0) {
+          // Strip Slack mrkdwn links like <url|text> → just text
+          function stripSlack(t) {
+            return (t||"").replace(/<https?:\/\/[^|>]+\|([^>]+)>/g,"$1")
+                          .replace(/<https?:\/\/[^>]+>/g,"[link]")
+                          .replace(/[*_]/g,"");
+          }
+          citBox.innerHTML = `
+            <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:10px;">
+              <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px;">
+                Sources (${data.citations.length})
+              </div>
+              ${data.citations.map((c,i) => `
+                <div style="border-left:2px solid var(--accent);padding:6px 10px;margin-bottom:8px;border-radius:0 6px 6px 0;background:var(--surface2);">
+                  <div style="font-family:'DM Mono',monospace;font-size:11px;color:var(--text-muted);margin-bottom:4px;">
+                    [${i+1}] ${c.timestamp_human || ""} · ${c.username || c.user_id || "unknown"}
+                  </div>
+                  <div style="font-size:12px;color:var(--text-soft);line-height:1.5;">
+                    ${stripSlack(c.snippet || c.text || "").slice(0,200)}${(c.snippet||"").length > 200 ? "…" : ""}
+                  </div>
+                </div>`).join("")}
+            </div>`;
+        } else {
+          citBox.innerHTML = "";
+        }
+
+        document.getElementById("chatAnswer").style.display = "block";
+        setStatus("Answer ready", "ok");
+        // Also clear raw JSON from output panel — show clean UI only
+        show({ ok: true, question: data.question, retrieved: data.retrieved_count });
+      } else if (r.status === 404 || r.status === 501) {
+        setStatus("/api/chat not built yet — coming Day 2!", "warn");
+        show({ note: "Day 2 task: build /api/chat in app/routers/chat.py" });
+      } else {
+        setStatus("Chat failed", "err");
       }
-
-      box.style.display = "block";
-      text.textContent = data.answer || "No answer returned.";
-      const citations = data.citations || [];
-      cites.innerHTML = citations.length
-        ? '<div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px;">Citations</div>' +
-          citations.map((c, i) => `<div style="font-size:12px;color:var(--text-soft);margin-bottom:6px;">[${i+1}] ${c.timestamp_human || ""} — ${(c.username || c.user_id || "unknown")}: ${(c.snippet || "").replace(/</g, "&lt;")}</div>`).join("")
-        : "";
-      setStatus("AI answer ready", "ok");
-    } catch (e) {
-      show({ ok:false, error:String(e) });
-      setStatus("AI failed", "err");
+    } catch(e) {
+      show({ ok:false, error: String(e) });
+      setStatus("Chat error", "err");
     } finally {
-      document.getElementById("askBtn").disabled = false;
+      const btn = document.getElementById("askBtn");
+      btn.disabled    = false;
+      btn.textContent = "Ask";
     }
   }
 
-  window.addEventListener("load", () => {
-    setStatus("Loading workspaces…");
-    loadWorkspaces().catch((e) => {
-      show({ ok:false, error:String(e) });
-      setStatus("Init failed", "err");
-    });
+  // textarea: Ctrl+Enter / Cmd+Enter to submit
+  document.addEventListener("DOMContentLoaded", () => {
+    const ta = document.getElementById("chatQuestion");
+    if (ta) {
+      ta.addEventListener("keydown", e => {
+        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") askChat();
+      });
+    }
   });
 </script>
 
