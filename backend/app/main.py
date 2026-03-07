@@ -543,46 +543,53 @@ def token_status(team_id: str):
 @app.get("/workspaces")
 def list_workspaces():
     workspaces = []
-    for page in secrets.get_paginator("list_secrets").paginate():
+    paginator = secrets.get_paginator("list_secrets")
+
+    for page in paginator.paginate():
         for s in page.get("SecretList", []):
             name = s.get("Name", "")
-            if not name.startswith(f"{SECRET_PREFIX}/"):
-                continue
-            if s.get("DeletedDate"):
-                continue
+            if name.startswith(f"{SECRET_PREFIX}/"):
+                team_id = name.split(f"{SECRET_PREFIX}/")[-1]
+                sec = read_secret(name)
+                team_name = None
+                if sec and "_error" not in sec:
+                    team_name = sec.get("team_name")
+                workspaces.append({"team_id": team_id, "team_name": team_name})
 
-            team_id = name.split(f"{SECRET_PREFIX}/")[-1]
-            sec = read_secret(name)
-            if not sec or "_error" in sec:
-                continue
-            if not sec.get("bot_token"):
-                continue
-
-            workspaces.append({
-                "team_id": team_id,
-                "team_name": sec.get("team_name") or "",
-            })
-
-    workspaces.sort(key=lambda x: ((x.get("team_name") or "").lower(), x["team_id"]))
     return {"ok": True, "workspaces": workspaces}
 
 @app.delete("/workspaces/{team_id}")
 def disconnect_workspace(team_id: str):
     name = secret_name(team_id)
-    sec  = read_secret(name)
+    sec = read_secret(name)
     if not sec or "_error" in sec:
         return {"ok": False, "team_id": team_id, "message": "Secret not found"}
-    bot_token   = sec.get("bot_token")
+
+    bot_token = sec.get("bot_token")
     revoke_data = None
+
+    # Revoke token on Slack
     if bot_token:
-        revoke_data = requests.post("https://slack.com/api/auth.revoke",
-                                    headers={"Authorization": f"Bearer {bot_token}"},
-                                    data={"test": "false"}, timeout=20).json()
+        r = requests.post(
+            "https://slack.com/api/auth.revoke",
+            headers={"Authorization": f"Bearer {bot_token}"},
+            data={"test": "false"},
+            timeout=20,
+        )
+        revoke_data = r.json()
+
+    # Delete secret
     try:
         secrets.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
     except Exception as e:
-        return {"ok": False, "team_id": team_id, "message": "Failed to delete secret",
-                "detail": str(e), "revoked": revoke_data}
+        return {
+            "ok": False,
+            "team_id": team_id,
+            "message": "Failed to delete secret",
+            "detail": str(e),
+            "revoked": revoke_data,
+        }
+
     return {"ok": True, "team_id": team_id, "revoked": revoke_data}
 
 @app.get("/channels")
