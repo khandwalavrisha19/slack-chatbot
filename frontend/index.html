@@ -384,10 +384,27 @@
     document.getElementById("out").textContent = JSON.stringify(obj, null, 2);
   }
 
-  async function safeJson(r){
+ async function safeJson(r){
     const text = await r.text();
-    try { return JSON.parse(text); } catch { return { ok:false, raw:text, status:r.status }; }
+    try { return JSON.parse(text); } catch { return { ok:false, raw:text }; }
   }
+
+  // ---------- Init ----------
+  (function init(){
+    const params = new URLSearchParams(window.location.search);
+    const team = params.get("team_id") || params.get("team") || "";
+    if (team) {
+      localStorage.setItem("LAST_TEAM_ID", team);
+      setStatus("OAuth complete: " + team, "ok");
+      const url = new URL(window.location.href);
+      url.searchParams.delete("team_id");
+      url.searchParams.delete("team");
+      window.history.replaceState({}, "", url.toString());
+    } else {
+      setStatus("Idle");
+    }
+    loadWorkspaces().catch(()=>{});
+  })();
 
   let oauthPopup = null;
 
@@ -416,57 +433,41 @@
     }
   });
 
-  async function loadWorkspaces(preferredTeamId = "") {
-    try {
+  async function loadWorkspaces(){
+    try{
       setStatus("Loading workspaces…");
       const r = await fetch(getApiBase() + "/workspaces");
       const data = await safeJson(r);
       show(data);
-
       const sel = document.getElementById("workspaceSelect");
-      const chSel = document.getElementById("channelSelect");
       sel.innerHTML = "";
-      chSel.innerHTML = '<option value="">— Load channels first —</option>';
-
+      const list = data.workspaces || [];
       if (!data.ok) {
         sel.innerHTML = '<option value="">— failed to load workspaces —</option>';
         setStatus("Workspaces load failed", "err");
         return;
       }
-
-      const list = data.workspaces || [];
-      if (!list.length) {
+      if (list.length === 0) {
         sel.innerHTML = '<option value="">— none connected yet —</option>';
         setStatus("No workspaces connected");
         return;
       }
-
-      let selectedFound = false;
-      list.forEach((w, index) => {
+      const last = localStorage.getItem("LAST_TEAM_ID") || "";
+      list.forEach(w => {
         const opt = document.createElement("option");
         opt.value = w.team_id;
         opt.textContent = w.team_id + (w.team_name ? (" • " + w.team_name) : "");
-        if (preferredTeamId && w.team_id === preferredTeamId) {
-          opt.selected = true;
-          selectedFound = true;
-        } else if (!preferredTeamId && index === 0) {
-          opt.selected = true;
-          selectedFound = true;
-        }
+        if (w.team_id === last) opt.selected = true;
         sel.appendChild(opt);
       });
-
-      if (!selectedFound && sel.options.length > 0) {
-        sel.selectedIndex = 0;
-      }
-
       setStatus("Workspaces loaded", "ok");
-      if (sel.value) await loadChannels();
-    } catch (e) {
+      if (sel.value) loadChannels();
+    }catch(e){
       show({ ok:false, error:String(e) });
       setStatus("Workspaces load failed", "err");
     }
   }
+
 
   async function checkToken() {
     try {
