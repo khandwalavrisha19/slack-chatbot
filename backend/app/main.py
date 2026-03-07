@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 # ---------------------- Env ----------------------
 AWS_REGION     = os.getenv("AWS_REGION", "ap-south-1")
-SECRET_PREFIX  = os.getenv("SECRET_PREFIX", "slackbot")
+SECRET_PREFIX  = os.getenv("SECRET_PREFIX")
 CLIENT_ID      = os.getenv("SLACK_CLIENT_ID")
 CLIENT_SECRET  = os.getenv("SLACK_CLIENT_SECRET")
 REDIRECT_URI   = os.getenv("SLACK_REDIRECT_URI")
