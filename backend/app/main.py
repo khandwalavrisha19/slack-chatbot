@@ -601,6 +601,142 @@ class ChatRequest(BaseModel):
     top_k: int = 10
 
 
+class MultiChatRequest(BaseModel):
+    team_id: str
+    channel_ids: list[str]
+    question: str
+    from_date: Optional[str] = None
+    to_date: Optional[str] = None
+    user_id: Optional[str] = None
+    top_k: int = 10
+
+
+def retrieve_messages_multi(
+    team_id: str,
+    channel_ids: list[str],
+    q: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    user_id: Optional[str] = None,
+    limit: int = 200,
+    top_k: int = 10,
+) -> list[dict]:
+    """Retrieve and merge messages from multiple channels, then rank by relevance."""
+    all_items: list[dict] = []
+    for channel_id in channel_ids:
+        try:
+            msgs = retrieve_messages(team_id, channel_id, q, from_date, to_date, user_id, limit, top_k * 3)
+            all_items.extend(msgs)
+        except Exception:
+            pass  # skip channels that error
+    if not all_items:
+        return []
+    if q and q.strip():
+        keywords = re.findall(r"\w+", q.lower())
+        def score(m):
+            text = (m.get("text") or "").lower()
+            s = sum(text.count(kw) for kw in keywords)
+            s += sum(2 for kw in keywords if kw in text[:80])
+            return s
+        all_items.sort(key=score, reverse=True)
+    else:
+        all_items.sort(key=lambda m: m.get("message_ts", ""), reverse=True)
+    return all_items[:top_k]
+
+
+@app.get("/api/search/multi")
+def api_search_multi(
+    team_id: str = Query(...),
+    channel_ids: str = Query(..., description="Comma-separated channel IDs"),
+    q: str | None = Query(None),
+    from_date: str | None = Query(None, alias="from"),
+    to_date: str | None = Query(None, alias="to"),
+    user_id: str | None = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+    top_k: int = Query(10, ge=1, le=50),
+    response: Response = None,
+):
+    """Search messages across multiple channels."""
+    if response is not None:
+        no_cache(response)
+    request_id = str(uuid.uuid4())[:8]
+    if from_date and to_date and from_date > to_date:
+        raise HTTPException(400, "'from' date must be before 'to' date")
+    ids = [c.strip() for c in channel_ids.split(",") if c.strip()]
+    if not ids:
+        raise HTTPException(400, "channel_ids must be a non-empty comma-separated list")
+    messages = retrieve_messages_multi(team_id, ids, q, from_date, to_date, user_id, limit, top_k)
+    if not messages:
+        return {"ok": True, "request_id": request_id, "query": q, "count": 0, "messages": [], "channels_searched": len(ids), "note": "No messages found."}
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "query": q,
+        "filters": {"from": from_date, "to": to_date, "user_id": user_id},
+        "channels_searched": len(ids),
+        "count": len(messages),
+        "messages": messages,
+    }
+
+
+@app.post("/api/chat/multi")
+def api_chat_multi(body: MultiChatRequest, response: Response):
+    """Ask AI a question using messages from multiple channels."""
+    no_cache(response)
+    if not body.question.strip():
+        raise HTTPException(400, "question cannot be empty")
+    if not body.channel_ids:
+        raise HTTPException(400, "channel_ids must be non-empty")
+    messages = retrieve_messages_multi(
+        body.team_id, body.channel_ids, body.question,
+        body.from_date, body.to_date, body.user_id,
+        200, min(body.top_k, 20),
+    )
+    if not messages:
+        return {"ok": True, "answer": "No relevant messages found across the selected channels for your question.", "citations": [], "channels_searched": len(body.channel_ids)}
+    context_lines = "\n".join([
+        f"[{i+1}] {m['timestamp_human']} | #{m.get('channel_id','')} | {m['username'] or m['user_id']}: {m['snippet']}"
+        for i, m in enumerate(messages)
+    ])
+    prompt = f"""You are a helpful assistant that answers questions about Slack conversations spanning multiple channels.
+Answer ONLY using the Slack messages provided below. Do NOT use outside knowledge.
+Each message is labeled with a channel ID so you can reference which channel it came from.
+If the answer is not in the messages, say: "I couldn't find that in the available messages."
+
+SLACK MESSAGES (from {len(body.channel_ids)} channels):
+{context_lines}
+
+QUESTION: {body.question}
+
+Respond in this format:
+Answer: <your answer here>
+Key points: <bullet points if relevant, otherwise skip>
+Action items: <any action items mentioned, or 'None'>
+Citations: <list message numbers like [1], [3]>"""
+    if not GROQ_API_KEY:
+        raise HTTPException(500, "GROQ_API_KEY not set")
+    resp = requests.post(
+        GROQ_URL,
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        json={"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.2, "max_tokens": 1500},
+        timeout=45,
+    )
+    data = resp.json()
+    if resp.status_code != 200:
+        raise HTTPException(502, f"Groq error: {data}")
+    answer_text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+    cited_indices = [int(n) - 1 for n in re.findall(r"\[(\d+)\]", answer_text) if n.isdigit() and 0 < int(n) <= len(messages)]
+    citations = [messages[i] for i in dict.fromkeys(cited_indices)]
+    return {
+        "ok": True,
+        "question": body.question,
+        "answer": answer_text,
+        "citations": citations,
+        "retrieved_count": len(messages),
+        "channels_searched": len(body.channel_ids),
+    }
+
+
 @app.post("/api/chat")
 def api_chat(body: ChatRequest, response: Response):
     no_cache(response)

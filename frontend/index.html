@@ -317,9 +317,30 @@
       <div class="panel-header">
         <span class="step-badge">03</span>
         <span class="panel-title">Search Messages</span>
+        <div style="margin-left:auto;">
+          <button id="searchModeToggle" onclick="toggleSearchMode()" style="font-size:11px;padding:3px 9px;border-radius:999px;background:var(--surface2);border:1px solid var(--border);color:var(--text-soft);">+ Multi-Channel</button>
+        </div>
       </div>
       <div class="panel-body">
-        <p class="hint">Search your Slack messages stored in DynamoDB. Add filters to narrow results.</p>
+        <p class="hint" id="searchHint">Search your Slack messages stored in DynamoDB. Add filters to narrow results.</p>
+
+        <!-- Single channel indicator -->
+        <div id="searchSingleChannelInfo" style="display:none;font-size:12px;color:var(--text-muted);padding:6px 10px;background:var(--surface2);border-radius:6px;border:1px solid var(--border);">
+          Searching in: <span id="searchSingleChannelName" style="color:var(--accent);font-weight:500;">#channel</span>
+        </div>
+
+        <!-- Multi-channel picker -->
+        <div id="multiSearchChannelPicker" style="display:none;">
+          <label>Select Channels to Search</label>
+          <div id="multiSearchChannelList" style="max-height:130px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);padding:6px 8px;display:flex;flex-direction:column;gap:4px;">
+            <span style="font-size:12px;color:var(--text-muted);">Load channels first (Step 02)</span>
+          </div>
+          <div style="display:flex;gap:6px;margin-top:5px;">
+            <button onclick="selectAllSearchChannels()" style="font-size:11px;padding:3px 8px;">Select All</button>
+            <button onclick="clearAllSearchChannels()" style="font-size:11px;padding:3px 8px;">Clear All</button>
+          </div>
+        </div>
+
         <div class="field">
           <label>Keyword</label>
           <input id="keyword" placeholder="e.g. deployment error" />
@@ -339,7 +360,7 @@
           <input id="searchUserId" placeholder="e.g. U012AB3CD" />
         </div>
         <div class="btn-group">
-          <button class="primary" onclick="searchMessages()">Search</button>
+          <button class="primary" id="searchBtn" onclick="searchMessages()">Search</button>
           <button onclick="clearSearch()">Clear</button>
         </div>
       </div>
@@ -350,9 +371,30 @@
       <div class="panel-header">
         <span class="step-badge">04</span>
         <span class="panel-title">Ask AI</span>
+        <div style="margin-left:auto;">
+          <button id="chatModeToggle" onclick="toggleChatMode()" style="font-size:11px;padding:3px 9px;border-radius:999px;background:var(--surface2);border:1px solid var(--border);color:var(--text-soft);">+ Multi-Channel</button>
+        </div>
       </div>
       <div class="panel-body">
         <p class="hint">Ask a question about your Slack messages. The AI answers using only your data.</p>
+
+        <!-- Single channel indicator -->
+        <div id="chatSingleChannelInfo" style="display:none;font-size:12px;color:var(--text-muted);padding:6px 10px;background:var(--surface2);border-radius:6px;border:1px solid var(--border);">
+          Asking in: <span id="chatSingleChannelName" style="color:var(--accent);font-weight:500;">#channel</span>
+        </div>
+
+        <!-- Multi-channel picker for chat -->
+        <div id="multiChatChannelPicker" style="display:none;">
+          <label>Select Channels to Query</label>
+          <div id="multiChatChannelList" style="max-height:130px;overflow-y:auto;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg);padding:6px 8px;display:flex;flex-direction:column;gap:4px;">
+            <span style="font-size:12px;color:var(--text-muted);">Load channels first (Step 02)</span>
+          </div>
+          <div style="display:flex;gap:6px;margin-top:5px;">
+            <button onclick="selectAllChatChannels()" style="font-size:11px;padding:3px 8px;">Select All</button>
+            <button onclick="clearAllChatChannels()" style="font-size:11px;padding:3px 8px;">Clear All</button>
+          </div>
+        </div>
+
         <div class="field">
           <label>Your Question</label>
           <textarea id="chatQuestion"
@@ -479,6 +521,9 @@
     if (!channels.length) { sel.innerHTML = '<option value="">— no channels returned —</option>'; setStatus("No channels", "warn"); return; }
     channels.forEach(c => { const opt=document.createElement("option"); opt.value=c.id; opt.textContent="#" + c.name; sel.appendChild(opt); });
     setStatus("Channels loaded", "ok");
+    // Refresh multi-channel pickers if they're open
+    if (searchMultiMode) populateMultiChannelList("multiSearchChannelList");
+    if (chatMultiMode)   populateMultiChannelList("multiChatChannelList");
   }
 
   async function backfillOneChannel(team_id, channel_id){
@@ -563,25 +608,131 @@
     }catch(e){ show({ok:false, error:String(e)}); setStatus("Disconnect failed", "err"); }
   }
 
+  // ── Mode state ────────────────────────────────────────────────────────────
+  let searchMultiMode = false;
+  let chatMultiMode   = false;
+
+  function toggleSearchMode() {
+    searchMultiMode = !searchMultiMode;
+    const btn = document.getElementById("searchModeToggle");
+    const picker = document.getElementById("multiSearchChannelPicker");
+    const info = document.getElementById("searchSingleChannelInfo");
+    if (searchMultiMode) {
+      btn.textContent = "✕ Single Channel";
+      btn.style.background = "rgba(155,127,232,0.12)";
+      btn.style.borderColor = "rgba(155,127,232,0.4)";
+      btn.style.color = "var(--accent)";
+      picker.style.display = "block";
+      info.style.display = "none";
+      populateMultiChannelList("multiSearchChannelList");
+    } else {
+      btn.textContent = "+ Multi-Channel";
+      btn.style.background = "";
+      btn.style.borderColor = "";
+      btn.style.color = "";
+      picker.style.display = "none";
+      info.style.display = "none";
+    }
+  }
+
+  function toggleChatMode() {
+    chatMultiMode = !chatMultiMode;
+    const btn = document.getElementById("chatModeToggle");
+    const picker = document.getElementById("multiChatChannelPicker");
+    const info = document.getElementById("chatSingleChannelInfo");
+    if (chatMultiMode) {
+      btn.textContent = "✕ Single Channel";
+      btn.style.background = "rgba(155,127,232,0.12)";
+      btn.style.borderColor = "rgba(155,127,232,0.4)";
+      btn.style.color = "var(--accent)";
+      picker.style.display = "block";
+      info.style.display = "none";
+      populateMultiChannelList("multiChatChannelList");
+    } else {
+      btn.textContent = "+ Multi-Channel";
+      btn.style.background = "";
+      btn.style.borderColor = "";
+      btn.style.color = "";
+      picker.style.display = "none";
+      info.style.display = "none";
+    }
+  }
+
+  function populateMultiChannelList(containerId) {
+    const container = document.getElementById(containerId);
+    const channelSel = document.getElementById("channelSelect");
+    const opts = Array.from(channelSel.options).filter(o => o.value);
+    if (!opts.length) {
+      container.innerHTML = '<span style="font-size:12px;color:var(--text-muted);">Load channels first (Step 02)</span>';
+      return;
+    }
+    // Sync: if already populated, keep selections
+    const existingChecked = new Set(
+      Array.from(container.querySelectorAll('input[type=checkbox]:checked')).map(cb => cb.value)
+    );
+    container.innerHTML = "";
+    opts.forEach(o => {
+      const label = document.createElement("label");
+      label.style.cssText = "display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text-soft);cursor:pointer;padding:2px 0;font-weight:400;text-transform:none;letter-spacing:0;margin-bottom:0;";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.value = o.value;
+      cb.style.cssText = "accent-color:var(--accent);width:13px;height:13px;flex-shrink:0;";
+      // Check all by default or restore previous state
+      cb.checked = existingChecked.size === 0 ? true : existingChecked.has(o.value);
+      label.appendChild(cb);
+      label.appendChild(document.createTextNode(o.textContent));
+      container.appendChild(label);
+    });
+  }
+
+  function getCheckedChannels(containerId) {
+    return Array.from(document.getElementById(containerId).querySelectorAll('input[type=checkbox]:checked')).map(cb => cb.value);
+  }
+
+  function selectAllSearchChannels() { document.getElementById("multiSearchChannelList").querySelectorAll('input').forEach(cb => cb.checked = true); }
+  function clearAllSearchChannels()  { document.getElementById("multiSearchChannelList").querySelectorAll('input').forEach(cb => cb.checked = false); }
+  function selectAllChatChannels()   { document.getElementById("multiChatChannelList").querySelectorAll('input').forEach(cb => cb.checked = true); }
+  function clearAllChatChannels()    { document.getElementById("multiChatChannelList").querySelectorAll('input').forEach(cb => cb.checked = false); }
+
   async function searchMessages(){
     try {
       const team_id = document.getElementById("workspaceSelect").value;
-      const channel_id = document.getElementById("channelSelect").value;
-      if (!team_id || !channel_id) { setStatus("Select workspace + channel first", "warn"); return; }
+      if (!team_id) { setStatus("Select workspace first", "warn"); return; }
       const q = document.getElementById("keyword").value.trim();
       const from = document.getElementById("fromDate").value;
       const to = document.getElementById("toDate").value;
       const user_id = document.getElementById("searchUserId").value.trim();
-      let url = getApiBase() + "/search?team_id=" + encodeURIComponent(team_id) + "&channel_id=" + encodeURIComponent(channel_id);
-      if (q) url += "&q=" + encodeURIComponent(q);
-      if (from) url += "&from=" + encodeURIComponent(from);
-      if (to) url += "&to=" + encodeURIComponent(to);
-      if (user_id) url += "&user_id=" + encodeURIComponent(user_id);
-      setStatus("Searching…");
-      const data = await fetchJson(url);
-      show(data);
-      const n = data.count || 0;
-      setStatus(data.ok ? (n > 0 ? `Found ${n} message${n===1?"":"s"}` : "No results found") : "Search failed", data.ok ? (n > 0 ? "ok" : "warn") : "err");
+
+      if (searchMultiMode) {
+        const channelIds = getCheckedChannels("multiSearchChannelList");
+        if (!channelIds.length) { setStatus("Select at least one channel", "warn"); return; }
+        let url = getApiBase() + "/search/multi?team_id=" + encodeURIComponent(team_id)
+          + "&channel_ids=" + encodeURIComponent(channelIds.join(","));
+        if (q) url += "&q=" + encodeURIComponent(q);
+        if (from) url += "&from=" + encodeURIComponent(from);
+        if (to) url += "&to=" + encodeURIComponent(to);
+        if (user_id) url += "&user_id=" + encodeURIComponent(user_id);
+        setStatus("Searching " + channelIds.length + " channels…");
+        const data = await fetchJson(url);
+        show(data);
+        const n = data.count || 0;
+        const chCount = data.channels_searched || channelIds.length;
+        setStatus(data.ok ? (n > 0 ? `Found ${n} result${n===1?"":"s"} across ${chCount} channels` : "No results found") : "Search failed", data.ok ? (n > 0 ? "ok" : "warn") : "err");
+      } else {
+        const channel_id = document.getElementById("channelSelect").value;
+        if (!channel_id) { setStatus("Select workspace + channel first", "warn"); return; }
+        let url = getApiBase() + "/search?team_id=" + encodeURIComponent(team_id) + "&channel_id=" + encodeURIComponent(channel_id);
+        if (q) url += "&q=" + encodeURIComponent(q);
+        if (from) url += "&from=" + encodeURIComponent(from);
+        if (to) url += "&to=" + encodeURIComponent(to);
+        if (user_id) url += "&user_id=" + encodeURIComponent(user_id);
+        setStatus("Searching…");
+        const data = await fetchJson(url);
+        show(data);
+        const n = data.count || 0;
+        setStatus(data.ok ? (n > 0 ? `Found ${n} message${n===1?"":"s"}` : "No results found") : "Search failed", data.ok ? (n > 0 ? "ok" : "warn") : "err");
+      }
     } catch(e) {
       show({ ok:false, error: String(e) });
       setStatus("Search error", "err");
@@ -591,10 +742,8 @@
   async function askChat() {
     try {
       const team_id    = document.getElementById("workspaceSelect").value;
-      const channel_id = document.getElementById("channelSelect").value;
       const question   = document.getElementById("chatQuestion").value.trim();
-
-      if (!team_id || !channel_id) { setStatus("Select workspace + channel first", "warn"); return; }
+      if (!team_id) { setStatus("Select a workspace first", "warn"); return; }
       if (!question)               { setStatus("Enter a question first", "warn"); return; }
       if (question.length > 500)   { setStatus("Question too long (max 500 chars)", "warn"); return; }
 
@@ -602,13 +751,29 @@
       btn.disabled    = true;
       btn.textContent = "Asking…";
       document.getElementById("chatAnswer").style.display = "none";
-      setStatus("Thinking…");
 
-      const r = await fetch(getApiBase() + "/chat", {
+      let requestBody;
+      let endpoint;
+
+      if (chatMultiMode) {
+        const channelIds = getCheckedChannels("multiChatChannelList");
+        if (!channelIds.length) { setStatus("Select at least one channel", "warn"); btn.disabled = false; btn.textContent = "Ask"; return; }
+        endpoint = getApiBase() + "/chat/multi";
+        requestBody = JSON.stringify({ team_id, channel_ids: channelIds, question });
+        setStatus("Thinking across " + channelIds.length + " channels…");
+      } else {
+        const channel_id = document.getElementById("channelSelect").value;
+        if (!channel_id) { setStatus("Select workspace + channel first", "warn"); btn.disabled = false; btn.textContent = "Ask"; return; }
+        endpoint = getApiBase() + "/chat";
+        requestBody = JSON.stringify({ team_id, channel_id, question });
+        setStatus("Thinking…");
+      }
+
+      const r = await fetch(endpoint, {
         method:      "POST",
         credentials: "include",
         headers:     { "Content-Type": "application/json" },
-        body:        JSON.stringify({ team_id, channel_id, question }),
+        body:        requestBody,
       });
       const data = await safeJson(r);
       show(data);
@@ -674,6 +839,11 @@
             + esc(actionItems).split("\n").join("<br>") + "</div></div>";
         }
 
+        // Multi-channel badge
+        if (data.channels_searched && data.channels_searched > 1) {
+          html = '<div style="font-size:11px;color:var(--accent);margin-bottom:8px;padding:4px 8px;background:rgba(155,127,232,0.08);border-radius:4px;border:1px solid rgba(155,127,232,0.2);">🌐 Answer synthesized from <strong>' + data.channels_searched + ' channels</strong> · ' + (data.retrieved_count || 0) + ' messages reviewed</div>' + html;
+        }
+
         document.getElementById("chatAnswerText").innerHTML = html;
 
         const citBox = document.getElementById("chatCitations");
@@ -691,7 +861,7 @@
               ${data.citations.map((c, i) => `
                 <div style="border-left:2px solid var(--accent);padding:6px 10px;margin-bottom:8px;border-radius:0 6px 6px 0;background:var(--surface2);">
                   <div style="font-family:'DM Mono',monospace;font-size:11px;color:var(--text-muted);margin-bottom:4px;">
-                    [${i + 1}] ${c.timestamp_human || ""} · ${c.username || c.user_id || "unknown"}
+                    [${i + 1}] ${c.timestamp_human || ""} · ${c.username || c.user_id || "unknown"}${c.channel_id ? ' · <span style="color:var(--accent);">#' + c.channel_id + '</span>' : ''}
                   </div>
                   <div style="font-size:12px;color:var(--text-soft);line-height:1.5;">
                     ${stripSlack(c.snippet || c.text || "").slice(0, 200)}${(c.snippet || "").length > 200 ? "…" : ""}
@@ -703,8 +873,9 @@
         }
 
         document.getElementById("chatAnswer").style.display = "block";
-        setStatus("Answer ready", "ok");
-        show({ ok: true, question: data.question, retrieved: data.retrieved_count });
+        const chInfo = data.channels_searched && data.channels_searched > 1 ? ` (${data.channels_searched} channels)` : "";
+        setStatus("Answer ready" + chInfo, "ok");
+        show({ ok: true, question: data.question, retrieved: data.retrieved_count, channels_searched: data.channels_searched });
       } else {
         setStatus("Chat failed", "err");
       }
