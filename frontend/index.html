@@ -587,6 +587,145 @@
       setStatus("Search error", "err");
     }
   }
+  // ── Ask AI ───────────────────────────────────────────────────────────────
+  async function askChat() {
+    try {
+      const team_id    = document.getElementById("workspaceSelect").value;
+      const channel_id = document.getElementById("channelSelect").value;
+      const question   = document.getElementById("chatQuestion").value.trim();
+
+      if (!team_id || !channel_id) { setStatus("Select workspace + channel first", "warn"); return; }
+      if (!question)               { setStatus("Enter a question first", "warn"); return; }
+      if (question.length > 500)   { setStatus("Question too long (max 500 chars)", "warn"); return; }
+
+      const btn = document.getElementById("askBtn");
+      btn.disabled    = true;
+      btn.textContent = "Asking…";
+      document.getElementById("chatAnswer").style.display = "none";
+      setStatus("Thinking…");
+
+      const r = await fetch(getApiBase() + "/chat", {
+        method:      "POST",
+        credentials: "include",
+        headers:     { "Content-Type": "application/json" },
+        body:        JSON.stringify({ team_id, channel_id, question }),
+      });
+      const data = await safeJson(r);
+      show(data);
+
+      if (r.status === 403) { setStatus("Access denied", "err"); return; }
+
+      if (data.ok && data.answer) {
+        var raw = data.answer || "";
+
+        function parseSection(text, label) {
+          var lines = text.split("\n");
+          var collecting = false;
+          var result = [];
+          var allLabels = ["answer", "key points", "action items", "citations"];
+          for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            var lineLower = line.toLowerCase();
+            var startsWithLabel = allLabels.some(function (l) { return lineLower.startsWith(l + ":"); });
+            if (lineLower.startsWith(label.toLowerCase() + ":")) {
+              collecting = true;
+              var rest = line.substring(line.indexOf(":") + 1).trim();
+              if (rest) result.push(rest);
+            } else if (collecting && startsWithLabel) {
+              break;
+            } else if (collecting) {
+              result.push(line);
+            }
+          }
+          return result.join("\n").trim();
+        }
+
+        function esc(s) {
+          return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        }
+
+        var answerText  = parseSection(raw, "Answer") || raw;
+        var keyPoints   = parseSection(raw, "Key points");
+        var actionItems = parseSection(raw, "Action items");
+
+        var html = '<div style="font-size:13px;color:var(--text);line-height:1.7;">'
+          + esc(answerText).split("\n").join("<br>") + "</div>";
+
+        if (keyPoints && keyPoints.toLowerCase() !== "none" && keyPoints.trim() !== "") {
+          var bullets = keyPoints.split("\n")
+            .map(function (b) { return b.replace(/^[\*\-]\s*/, "").trim(); })
+            .filter(function (b) { return b.length > 0; });
+          html += '<div style="margin-top:12px;">'
+            + '<div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px;">Key Points</div>';
+          for (var i = 0; i < bullets.length; i++) {
+            html += '<div style="display:flex;gap:6px;margin-bottom:4px;font-size:13px;color:var(--text-soft);">'
+              + '<span style="color:var(--accent);flex-shrink:0;">&#xB7;</span>'
+              + "<span>" + esc(bullets[i]) + "</span></div>";
+          }
+          html += "</div>";
+        }
+
+        if (actionItems && actionItems.toLowerCase() !== "none" && actionItems.trim() !== "") {
+          html += '<div style="margin-top:12px;padding:8px 12px;border-radius:6px;'
+            + "background:rgba(155,127,232,0.07);border:1px solid rgba(155,127,232,0.15);\">"
+            + '<div style="font-size:11px;font-weight:600;color:var(--accent);text-transform:uppercase;'
+            + 'letter-spacing:.04em;margin-bottom:4px;">Action Items</div>'
+            + '<div style="font-size:13px;color:var(--text-soft);">'
+            + esc(actionItems).split("\n").join("<br>") + "</div></div>";
+        }
+
+        document.getElementById("chatAnswerText").innerHTML = html;
+
+        const citBox = document.getElementById("chatCitations");
+        if (data.citations && data.citations.length > 0) {
+          function stripSlack(t) {
+            return (t || "").replace(/<https?:\/\/[^|>]+\|([^>]+)>/g, "$1")
+              .replace(/<https?:\/\/[^>]+>/g, "[link]")
+              .replace(/[*_]/g, "");
+          }
+          citBox.innerHTML = `
+            <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:10px;">
+              <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px;">
+                Sources (${data.citations.length})
+              </div>
+              ${data.citations.map((c, i) => `
+                <div style="border-left:2px solid var(--accent);padding:6px 10px;margin-bottom:8px;border-radius:0 6px 6px 0;background:var(--surface2);">
+                  <div style="font-family:'DM Mono',monospace;font-size:11px;color:var(--text-muted);margin-bottom:4px;">
+                    [${i + 1}] ${c.timestamp_human || ""} · ${c.username || c.user_id || "unknown"}
+                  </div>
+                  <div style="font-size:12px;color:var(--text-soft);line-height:1.5;">
+                    ${stripSlack(c.snippet || c.text || "").slice(0, 200)}${(c.snippet || "").length > 200 ? "…" : ""}
+                  </div>
+                </div>`).join("")}
+            </div>`;
+        } else {
+          citBox.innerHTML = "";
+        }
+
+        document.getElementById("chatAnswer").style.display = "block";
+        setStatus("Answer ready", "ok");
+        show({ ok: true, question: data.question, retrieved: data.retrieved_count });
+      } else {
+        setStatus("Chat failed", "err");
+      }
+    } catch (e) {
+      show({ ok: false, error: String(e) });
+      setStatus("Chat error", "err");
+    } finally {
+      const btn = document.getElementById("askBtn");
+      btn.disabled    = false;
+      btn.textContent = "Ask";
+    }
+  }
+// ── Keyboard shortcut: Ctrl+Enter in textarea ─────────────────────────
+  document.addEventListener("DOMContentLoaded", () => {
+    const ta = document.getElementById("chatQuestion");
+    if (ta) {
+      ta.addEventListener("keydown", e => {
+        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") askChat();
+      });
+    }
+  });
 
   function clearSearch(){
     document.getElementById("keyword").value = "";
