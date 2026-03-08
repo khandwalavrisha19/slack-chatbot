@@ -187,20 +187,16 @@ Resources:
               OriginProtocolPolicy: https-only
               OriginSSLProtocols: [TLSv1.2]
 
-        DefaultCacheBehavior:DefaultCacheBehavior:
+        DefaultCacheBehavior:
           TargetOriginId: s3-origin
           ViewerProtocolPolicy: redirect-to-https
           AllowedMethods: [GET, HEAD, OPTIONS]
           CachedMethods: [GET, HEAD]
           Compress: true
-          MinTTL: 0
-          DefaultTTL: 0          # ← don't cache index.html at CloudFront edge
-          MaxTTL: 0
           ForwardedValues:
             QueryString: false
             Cookies:
               Forward: none
-
 
         # Route API endpoints to API Gateway
         CacheBehaviors:
