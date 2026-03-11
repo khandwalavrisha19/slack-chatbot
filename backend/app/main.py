@@ -140,6 +140,148 @@ def _ts_human(ts: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# USER CACHE  (pk = "{team_id}#__users__",  sk = user_id)
+# Stores display_name + real_name so we can look up user_id by username.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _user_pk(team_id: str) -> str:
+    return f"{team_id}#__users__"
+
+
+def get_cached_user(team_id: str, user_id: str) -> Optional[dict]:
+    """Return the cached user record for a user_id, or None."""
+    if ddb_table is None:
+        return None
+    try:
+        resp = ddb_table.get_item(Key={"pk": _user_pk(team_id), "sk": user_id})
+        return resp.get("Item")
+    except Exception:
+        return None
+
+
+def upsert_cached_user(team_id: str, user_id: str, display_name: str, real_name: str) -> None:
+    """Store / update a user record in the cache table."""
+    if ddb_table is None:
+        return
+    try:
+        ddb_table.put_item(Item={
+            "pk":           _user_pk(team_id),
+            "sk":           user_id,
+            "user_id":      user_id,
+            "display_name": display_name,
+            "real_name":    real_name,
+            "cached_at":    datetime.utcnow().isoformat() + "Z",
+        })
+    except Exception as e:
+        logger.warning(f"[user-cache] upsert failed for {user_id}: {e}")
+
+
+def resolve_user_id(team_id: str, username: str, bot_token: str) -> Optional[str]:
+    """
+    Given a display name / real name (e.g. 'vrisha'), return the matching
+    Slack user_id.  Checks the DynamoDB cache first; falls back to the
+    Slack users.list API and populates the cache.
+    Returns None if no match is found.
+    """
+    if not username or not bot_token:
+        return None
+
+    needle = username.strip().lower()
+
+    # ── 1. Check cache (scan the user-cache partition for this team) ──────────
+    if ddb_table is not None:
+        try:
+            resp = ddb_table.query(
+                KeyConditionExpression=Key("pk").eq(_user_pk(team_id)),
+            )
+            for item in resp.get("Items", []):
+                dn = (item.get("display_name") or "").lower()
+                rn = (item.get("real_name")    or "").lower()
+                if needle in dn or needle in rn or dn.startswith(needle) or rn.startswith(needle):
+                    logger.info(f"[user-cache] resolved '{username}' → {item['user_id']} (cache hit)")
+                    return item["user_id"]
+        except Exception as e:
+            logger.warning(f"[user-cache] cache query failed: {e}")
+
+    # ── 2. Fetch full user list from Slack and populate cache ─────────────────
+    logger.info(f"[user-cache] cache miss for '{username}', fetching users.list from Slack")
+    cursor = None
+    matched_id: Optional[str] = None
+
+    while True:
+        params: dict = {"limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            r    = requests.get(
+                "https://slack.com/api/users.list",
+                headers={"Authorization": f"Bearer {bot_token}"},
+                params=params,
+                timeout=20,
+            )
+            data = r.json()
+        except Exception as e:
+            logger.warning(f"[user-cache] users.list request failed: {e}")
+            break
+
+        if not data.get("ok"):
+            logger.warning(f"[user-cache] users.list error: {data.get('error')}")
+            break
+
+        for member in data.get("members", []):
+            uid     = member.get("id", "")
+            profile = member.get("profile") or {}
+            dn      = (profile.get("display_name") or member.get("name") or "").strip()
+            rn      = (profile.get("real_name")    or "").strip()
+            if uid:
+                upsert_cached_user(team_id, uid, dn, rn)
+                # check match while we iterate
+                if matched_id is None:
+                    dn_l = dn.lower()
+                    rn_l = rn.lower()
+                    if needle in dn_l or needle in rn_l or dn_l.startswith(needle) or rn_l.startswith(needle):
+                        matched_id = uid
+                        logger.info(f"[user-cache] resolved '{username}' → {uid} (display='{dn}', real='{rn}')")
+
+        cursor = (data.get("response_metadata") or {}).get("next_cursor") or ""
+        if not cursor:
+            break
+
+    return matched_id
+
+
+def resolve_username_for_message(team_id: str, user_id: str, bot_token: str) -> str:
+    """
+    Return display_name for a user_id.  Uses cache; falls back to
+    users.info API for a single user if not cached yet.
+    """
+    if not user_id:
+        return ""
+    cached = get_cached_user(team_id, user_id)
+    if cached:
+        return cached.get("display_name") or cached.get("real_name") or user_id
+
+    # single-user fallback
+    try:
+        r    = requests.get(
+            "https://slack.com/api/users.info",
+            headers={"Authorization": f"Bearer {bot_token}"},
+            params={"user": user_id},
+            timeout=10,
+        )
+        data = r.json()
+        if data.get("ok"):
+            profile = (data.get("user") or {}).get("profile") or {}
+            dn = (profile.get("display_name") or data["user"].get("name") or "").strip()
+            rn = (profile.get("real_name")    or "").strip()
+            upsert_cached_user(team_id, user_id, dn, rn)
+            return dn or rn or user_id
+    except Exception:
+        pass
+    return user_id
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SESSION MANAGEMENT
 # ═══════════════════════════════════════════════════════════════════════════════
 #
@@ -314,8 +456,20 @@ def retrieve_messages(
     q: Optional[str] = None, from_date: Optional[str] = None,
     to_date: Optional[str] = None, user_id: Optional[str] = None,
     limit: int = 200, top_k: int = 10,
+    username: Optional[str] = None, bot_token: Optional[str] = None,
 ) -> list[dict]:
     require_ddb()
+
+    # ── Resolve username → user_id if caller supplied a name ─────────────────
+    if username and not user_id and bot_token:
+        resolved = resolve_user_id(team_id, username, bot_token)
+        if resolved:
+            user_id = resolved
+        else:
+            # No match found — return empty rather than ignoring the filter
+            logger.info(f"[retrieve] username '{username}' not found in workspace {team_id}")
+            return []
+
     pk       = f"{team_id}#{channel_id}"
     key_expr = Key("pk").eq(pk)
     if from_date and to_date:
@@ -344,7 +498,17 @@ def retrieve_messages_multi(
     q: Optional[str] = None, from_date: Optional[str] = None,
     to_date: Optional[str] = None, user_id: Optional[str] = None,
     limit: int = 200, top_k: int = 10,
+    username: Optional[str] = None, bot_token: Optional[str] = None,
 ) -> list[dict]:
+    # Resolve username once up-front so every channel uses the same user_id
+    if username and not user_id and bot_token:
+        resolved = resolve_user_id(team_id, username, bot_token)
+        if resolved:
+            user_id = resolved
+        else:
+            logger.info(f"[retrieve_multi] username '{username}' not found in workspace {team_id}")
+            return []
+
     all_items: list[dict] = []
     for channel_id in channel_ids:
         try:
@@ -665,10 +829,12 @@ def backfill_channel(team_id: str, channel_id: str, request: Request, limit: int
         ts_msg = str(m.get("ts"))
         if not ts_msg:
             continue
+        uid      = m.get("user")
+        username = resolve_username_for_message(team_id, uid, sec["bot_token"]) if uid else ""
         item = {
             "pk": pk, "sk": ts_msg,
             "team_id": team_id, "channel_id": channel_id, "ts": ts_msg,
-            "user_id": m.get("user"), "text": m.get("text", ""),
+            "user_id": uid, "username": username, "text": m.get("text", ""),
             "thread_ts": m.get("thread_ts"), "reply_count": m.get("reply_count", 0),
             "subtype": m.get("subtype"), "type": m.get("type"),
             "fetched_at": datetime.utcnow().isoformat() + "Z",
@@ -710,10 +876,20 @@ async def slack_events(request: Request):
     ts_msg     = event.get("ts")
     if not team_id or not channel_id or not ts_msg:
         return JSONResponse({"ok": True})
+    uid = event.get("user")
+    # Resolve username — read bot token from Secrets Manager
+    event_username = ""
+    if uid:
+        try:
+            sec = read_secret(secret_name(team_id))
+            if sec and not sec.get("_error") and sec.get("bot_token"):
+                event_username = resolve_username_for_message(team_id, uid, sec["bot_token"])
+        except Exception:
+            pass
     item = {
         "pk": f"{team_id}#{channel_id}", "sk": str(ts_msg),
         "team_id": team_id, "channel_id": channel_id, "ts": str(ts_msg),
-        "user_id": event.get("user"), "text": event.get("text", ""),
+        "user_id": uid, "username": event_username, "text": event.get("text", ""),
         "thread_ts": event.get("thread_ts"), "subtype": event.get("subtype"),
         "type": event.get("type"), "fetched_at": datetime.utcnow().isoformat() + "Z",
     }
@@ -751,6 +927,7 @@ def api_search(
     from_date: str | None = Query(None, alias="from"),
     to_date: str | None = Query(None, alias="to"),
     user_id: str | None = Query(None),
+    username: str | None = Query(None),
     limit: int = Query(200, ge=1, le=1000),
     top_k: int = Query(10, ge=1, le=12),
     request: Request = None, response: Response = None,
@@ -760,15 +937,19 @@ def api_search(
     require_team_access(request, team_id)
     if from_date and to_date and from_date > to_date:
         raise HTTPException(400, "'from' must be before 'to'")
+    sec = read_secret(secret_name(team_id))
+    bot_token = (sec or {}).get("bot_token") if sec and not sec.get("_error") else None
     request_id = str(uuid.uuid4())[:8]
     try:
-        messages = retrieve_messages(team_id, channel_id, q, from_date, to_date, user_id, limit, top_k)
+        messages = retrieve_messages(team_id, channel_id, q, from_date, to_date, user_id, limit, top_k,
+                                     username=username, bot_token=bot_token)
     except RuntimeError as e:
         raise HTTPException(500, str(e))
     if not messages:
-        return {"ok": True, "request_id": request_id, "query": q, "count": 0, "messages": [], "note": "No messages found."}
+        note = f"No messages found from user '{username}'." if username else "No messages found."
+        return {"ok": True, "request_id": request_id, "query": q, "count": 0, "messages": [], "note": note}
     return {"ok": True, "request_id": request_id, "query": q,
-            "filters": {"from": from_date, "to": to_date, "user_id": user_id},
+            "filters": {"from": from_date, "to": to_date, "user_id": user_id, "username": username},
             "count": len(messages), "messages": messages}
 
 
@@ -780,6 +961,7 @@ def api_search_multi(
     from_date: str | None = Query(None, alias="from"),
     to_date: str | None = Query(None, alias="to"),
     user_id: str | None = Query(None),
+    username: str | None = Query(None),
     limit: int = Query(200, ge=1, le=1000),
     top_k: int = Query(10, ge=1, le=50),
     request: Request = None, response: Response = None,
@@ -792,13 +974,17 @@ def api_search_multi(
     ids = [c.strip() for c in channel_ids.split(",") if c.strip()]
     if not ids:
         raise HTTPException(400, "channel_ids must be non-empty")
+    sec = read_secret(secret_name(team_id))
+    bot_token = (sec or {}).get("bot_token") if sec and not sec.get("_error") else None
     request_id = str(uuid.uuid4())[:8]
-    messages   = retrieve_messages_multi(team_id, ids, q, from_date, to_date, user_id, limit, top_k)
+    messages   = retrieve_messages_multi(team_id, ids, q, from_date, to_date, user_id, limit, top_k,
+                                         username=username, bot_token=bot_token)
     if not messages:
+        note = f"No messages found from user '{username}'." if username else "No messages found."
         return {"ok": True, "request_id": request_id, "query": q, "count": 0,
-                "messages": [], "channels_searched": len(ids), "note": "No messages found."}
+                "messages": [], "channels_searched": len(ids), "note": note}
     return {"ok": True, "request_id": request_id, "query": q,
-            "filters": {"from": from_date, "to": to_date, "user_id": user_id},
+            "filters": {"from": from_date, "to": to_date, "user_id": user_id, "username": username},
             "channels_searched": len(ids), "count": len(messages), "messages": messages}
 
 
@@ -811,6 +997,7 @@ class ChatRequest(BaseModel):
     from_date: Optional[str] = None
     to_date: Optional[str] = None
     user_id: Optional[str] = None
+    username: Optional[str] = None   # display name filter — resolved server-side
     top_k: int = 10
 
 
@@ -821,6 +1008,7 @@ class MultiChatRequest(BaseModel):
     from_date: Optional[str] = None
     to_date: Optional[str] = None
     user_id: Optional[str] = None
+    username: Optional[str] = None   # display name filter — resolved server-side
     top_k: int = 10
 
 
@@ -830,10 +1018,14 @@ def api_chat(body: ChatRequest, request: Request, response: Response):
     require_team_access(request, body.team_id)
     if not body.question.strip():
         raise HTTPException(400, "question cannot be empty")
+    sec = read_secret(secret_name(body.team_id))
+    bot_token = (sec or {}).get("bot_token") if sec and not sec.get("_error") else None
     messages = retrieve_messages(body.team_id, body.channel_id, body.question,
-                                  body.from_date, body.to_date, body.user_id, 200, min(body.top_k, 12))
+                                  body.from_date, body.to_date, body.user_id, 200, min(body.top_k, 12),
+                                  username=body.username, bot_token=bot_token)
     if not messages:
-        return {"ok": True, "answer": "No relevant messages found in this channel.", "citations": []}
+        note = f"No relevant messages found from user '{body.username}'." if body.username else "No relevant messages found in this channel."
+        return {"ok": True, "answer": note, "citations": []}
     context = "\n".join([f"[{i+1}] {m['timestamp_human']} | {m['username'] or m['user_id']}: {m['snippet']}"
                          for i, m in enumerate(messages)])
     prompt = f"""You are a helpful assistant answering questions about Slack conversations.
@@ -864,11 +1056,14 @@ def api_chat_multi(body: MultiChatRequest, request: Request, response: Response)
         raise HTTPException(400, "question cannot be empty")
     if not body.channel_ids:
         raise HTTPException(400, "channel_ids must be non-empty")
+    sec = read_secret(secret_name(body.team_id))
+    bot_token = (sec or {}).get("bot_token") if sec and not sec.get("_error") else None
     messages = retrieve_messages_multi(body.team_id, body.channel_ids, body.question,
-                                        body.from_date, body.to_date, body.user_id, 200, min(body.top_k, 20))
+                                        body.from_date, body.to_date, body.user_id, 200, min(body.top_k, 20),
+                                        username=body.username, bot_token=bot_token)
     if not messages:
-        return {"ok": True, "answer": "No relevant messages found across selected channels.",
-                "citations": [], "channels_searched": len(body.channel_ids)}
+        note = f"No relevant messages found from user '{body.username}'." if body.username else "No relevant messages found across selected channels."
+        return {"ok": True, "answer": note, "citations": [], "channels_searched": len(body.channel_ids)}
     context = "\n".join([
         f"[{i+1}] {m['timestamp_human']} | #{m.get('channel_id','')} | {m['username'] or m['user_id']}: {m['snippet']}"
         for i, m in enumerate(messages)])

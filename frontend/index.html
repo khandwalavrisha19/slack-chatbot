@@ -365,8 +365,8 @@
           </div>
         </div>
         <div class="field">
-          <label>User ID (optional)</label>
-          <input id="searchUserId" placeholder="e.g. U012AB3CD" />
+          <label>Username (optional)</label>
+          <input id="searchUserId" placeholder="e.g. vrisha" />
         </div>
         <div class="btn-group">
           <button class="primary" id="searchBtn" onclick="searchMessages()">Search</button>
@@ -413,6 +413,10 @@
                    background:var(--bg);color:var(--text);
                    font-family:'DM Sans',sans-serif;font-size:13px;
                    outline:none;transition:border-color .2s,box-shadow .2s;"></textarea>
+        </div>
+        <div class="field">
+          <label>Filter by username <span style="font-weight:400;color:var(--text-muted)">(optional — e.g. vrisha)</span></label>
+          <input id="chatUsername" placeholder="Leave blank to search all users" style="width:100%;" />
         </div>
         <div class="btn-group">
           <button class="primary" id="askBtn" onclick="askChat()">Ask</button>
@@ -742,7 +746,7 @@
         if (q) url += "&q=" + encodeURIComponent(q);
         if (from) url += "&from=" + encodeURIComponent(from);
         if (to) url += "&to=" + encodeURIComponent(to);
-        if (user_id) url += "&user_id=" + encodeURIComponent(user_id);
+        if (user_id) url += "&username=" + encodeURIComponent(user_id);
         setStatus("Searching " + channelIds.length + " channels…");
         const data = await fetchJson(url);
         show(data);
@@ -756,7 +760,7 @@
         if (q) url += "&q=" + encodeURIComponent(q);
         if (from) url += "&from=" + encodeURIComponent(from);
         if (to) url += "&to=" + encodeURIComponent(to);
-        if (user_id) url += "&user_id=" + encodeURIComponent(user_id);
+        if (user_id) url += "&username=" + encodeURIComponent(user_id);
         setStatus("Searching…");
         const data = await fetchJson(url);
         show(data);
@@ -773,6 +777,7 @@
     try {
       const team_id    = document.getElementById("workspaceSelect").value;
       const question   = document.getElementById("chatQuestion").value.trim();
+      const chatUsername = (document.getElementById("chatUsername").value || "").trim();
       if (!team_id) { setStatus("Select a workspace first", "warn"); return; }
       if (!question)               { setStatus("Enter a question first", "warn"); return; }
       if (question.length > 500)   { setStatus("Question too long (max 500 chars)", "warn"); return; }
@@ -789,14 +794,18 @@
         const channelIds = getCheckedChannels("multiChatChannelList");
         if (!channelIds.length) { setStatus("Select at least one channel", "warn"); btn.disabled = false; btn.textContent = "Ask"; return; }
         endpoint = getApiBase() + "/chat/multi";
-        requestBody = JSON.stringify({ team_id, channel_ids: channelIds, question });
-        setStatus("Thinking across " + channelIds.length + " channels…");
+        const payload = { team_id, channel_ids: channelIds, question };
+        if (chatUsername) payload.username = chatUsername;
+        requestBody = JSON.stringify(payload);
+        setStatus("Thinking across " + channelIds.length + " channels" + (chatUsername ? " for @" + chatUsername : "") + "…");
       } else {
         const channel_id = document.getElementById("channelSelect").value;
         if (!channel_id) { setStatus("Select workspace + channel first", "warn"); btn.disabled = false; btn.textContent = "Ask"; return; }
         endpoint = getApiBase() + "/chat";
-        requestBody = JSON.stringify({ team_id, channel_id, question });
-        setStatus("Thinking…");
+        const payload = { team_id, channel_id, question };
+        if (chatUsername) payload.username = chatUsername;
+        requestBody = JSON.stringify(payload);
+        setStatus("Thinking" + (chatUsername ? " about @" + chatUsername : "") + "…");
       }
 
       const r = await fetch(endpoint, {
@@ -933,6 +942,7 @@
     document.getElementById("fromDate").value = "";
     document.getElementById("toDate").value = "";
     document.getElementById("searchUserId").value = "";
+    document.getElementById("chatUsername").value = "";
     show({});
     setStatus("Cleared");
   }
