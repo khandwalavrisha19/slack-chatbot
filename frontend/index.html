@@ -407,16 +407,12 @@
         <div class="field">
           <label>Your Question</label>
           <textarea id="chatQuestion"
-            placeholder="e.g. What did we decide about the API design?"
+            placeholder="e.g. What did we decide about the API design? or What did @vrisha say last?"
             style="width:100%;min-height:72px;resize:vertical;padding:9px 12px;
                    border-radius:6px;border:1px solid var(--border);
                    background:var(--bg);color:var(--text);
                    font-family:'DM Sans',sans-serif;font-size:13px;
                    outline:none;transition:border-color .2s,box-shadow .2s;"></textarea>
-        </div>
-        <div class="field">
-          <label>Filter by username <span style="font-weight:400;color:var(--text-muted)">(optional — e.g. vrisha)</span></label>
-          <input id="chatUsername" placeholder="Leave blank to search all users" style="width:100%;" />
         </div>
         <div class="btn-group">
           <button class="primary" id="askBtn" onclick="askChat()">Ask</button>
@@ -777,7 +773,6 @@
     try {
       const team_id    = document.getElementById("workspaceSelect").value;
       const question   = document.getElementById("chatQuestion").value.trim();
-      const chatUsername = (document.getElementById("chatUsername").value || "").trim();
       if (!team_id) { setStatus("Select a workspace first", "warn"); return; }
       if (!question)               { setStatus("Enter a question first", "warn"); return; }
       if (question.length > 500)   { setStatus("Question too long (max 500 chars)", "warn"); return; }
@@ -794,17 +789,13 @@
         const channelIds = getCheckedChannels("multiChatChannelList");
         if (!channelIds.length) { setStatus("Select at least one channel", "warn"); btn.disabled = false; btn.textContent = "Ask"; return; }
         endpoint = getApiBase() + "/chat/multi";
-        const payload = { team_id, channel_ids: channelIds, question };
-        if (chatUsername) payload.username = chatUsername;
-        requestBody = JSON.stringify(payload);
+        requestBody = JSON.stringify({ team_id, channel_ids: channelIds, question });
         setStatus("Thinking across " + channelIds.length + " channels…");
       } else {
         const channel_id = document.getElementById("channelSelect").value;
         if (!channel_id) { setStatus("Select workspace + channel first", "warn"); btn.disabled = false; btn.textContent = "Ask"; return; }
         endpoint = getApiBase() + "/chat";
-        const payload = { team_id, channel_id, question };
-        if (chatUsername) payload.username = chatUsername;
-        requestBody = JSON.stringify(payload);
+        requestBody = JSON.stringify({ team_id, channel_id, question });
         setStatus("Thinking…");
       }
 
@@ -948,7 +939,6 @@
     document.getElementById("fromDate").value = "";
     document.getElementById("toDate").value = "";
     document.getElementById("searchUserId").value = "";
-    document.getElementById("chatUsername").value = "";
     show({});
     setStatus("Cleared");
   }

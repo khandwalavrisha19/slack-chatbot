@@ -281,49 +281,20 @@ def resolve_username_for_message(team_id: str, user_id: str, bot_token: str) -> 
     return user_id
 
 
-# ─── patterns that signal the user is asking about a specific person ─────────
-#  "what did vrisha say"   "vrisha's last message"   "messages from vrisha"
-#  "sent by vrisha"        "vrisha mentioned"         "show me vrisha"
-_USER_QUESTION_PATTERNS = [
-    re.compile(r"\bwhat (?:did|has|was) ([A-Za-z][A-Za-z0-9._-]{1,30})\b", re.I),
-    re.compile(r"\b([A-Za-z][A-Za-z0-9._-]{1,30})(?:'s| s)\s+(?:last|latest|recent|first|message|msg)", re.I),
-    re.compile(r"\b(?:from|by|sent by|posted by|written by|messages? from|msg from)\s+([A-Za-z][A-Za-z0-9._-]{1,30})\b", re.I),
-    re.compile(r"\b([A-Za-z][A-Za-z0-9._-]{1,30})\s+(?:said|wrote|posted|mentioned|asked|replied|sent|shared)\b", re.I),
-    re.compile(r"\b(?:show|find|get|list|give me|summarize)\s+(?:me\s+)?(?:all\s+)?(?:messages?\s+(?:from|by)\s+)?([A-Za-z][A-Za-z0-9._-]{1,30})\b", re.I),
-    re.compile(r"\b([A-Za-z][A-Za-z0-9._-]{1,30})\s+(?:last|latest|recent)\s+(?:message|msg|post|comment)\b", re.I),
-]
-
-# words that look like names but are never real user names
-_STOP_WORDS = {
-    "what", "when", "where", "who", "why", "how", "did", "has", "was", "were",
-    "the", "a", "an", "is", "are", "all", "any", "some", "can", "could",
-    "would", "should", "will", "do", "does", "get", "give", "me", "my",
-    "our", "their", "this", "that", "these", "those", "last", "latest",
-    "recent", "first", "message", "messages", "msg", "said", "sent", "post",
-    "from", "by", "in", "on", "at", "about", "show", "find", "list",
-    "summarize", "slack", "channel", "team", "user", "reply", "replies",
-    "wrote", "posted", "mentioned", "asked",
-}
+_AT_MENTION = re.compile(r"@([A-Za-z][A-Za-z0-9._-]{1,30})")
 
 
 def extract_username_from_question(question: str) -> Optional[str]:
     """
-    Scan a natural-language question for a person's name.
-    Returns the first plausible name found, or None.
-
-    Examples that match:
-      "what did vrisha say last?"          → "vrisha"
-      "vrisha's last message"              → "vrisha"
-      "messages from john.doe"             → "john.doe"
-      "what did alice post yesterday?"     → "alice"
+    Extract a username only if the user explicitly typed @name in their question.
+    Returns the name without the @ sign, or None.
+    e.g. "what did @vrisha say last?" → "vrisha"
     """
-    for pattern in _USER_QUESTION_PATTERNS:
-        m = pattern.search(question)
-        if m:
-            candidate = m.group(1).strip().rstrip("'s").strip()
-            if candidate.lower() not in _STOP_WORDS and len(candidate) >= 2:
-                logger.info(f"[name-extract] extracted '{candidate}' from question: {question!r}")
-                return candidate
+    m = _AT_MENTION.search(question)
+    if m:
+        name = m.group(1).strip()
+        logger.info(f"[name-extract] @mention extracted '{name}' from question: {question!r}")
+        return name
     return None
 
 
@@ -1043,7 +1014,6 @@ class ChatRequest(BaseModel):
     from_date: Optional[str] = None
     to_date: Optional[str] = None
     user_id: Optional[str] = None
-    username: Optional[str] = None   # display name filter — resolved server-side
     top_k: int = 10
 
 
@@ -1054,7 +1024,6 @@ class MultiChatRequest(BaseModel):
     from_date: Optional[str] = None
     to_date: Optional[str] = None
     user_id: Optional[str] = None
-    username: Optional[str] = None   # display name filter — resolved server-side
     top_k: int = 10
 
 
@@ -1068,7 +1037,7 @@ def api_chat(body: ChatRequest, request: Request, response: Response):
     bot_token = (sec or {}).get("bot_token") if sec and not sec.get("_error") else None
 
     # Auto-extract a username from the question if not explicitly provided
-    active_username = body.username or extract_username_from_question(body.question)
+    active_username = extract_username_from_question(body.question)
 
     messages = retrieve_messages(body.team_id, body.channel_id, body.question,
                                   body.from_date, body.to_date, body.user_id, 200, min(body.top_k, 12),
@@ -1112,7 +1081,7 @@ def api_chat_multi(body: MultiChatRequest, request: Request, response: Response)
     bot_token = (sec or {}).get("bot_token") if sec and not sec.get("_error") else None
 
     # Auto-extract a username from the question if not explicitly provided
-    active_username = body.username or extract_username_from_question(body.question)
+    active_username = extract_username_from_question(body.question)
 
     messages = retrieve_messages_multi(body.team_id, body.channel_ids, body.question,
                                         body.from_date, body.to_date, body.user_id, 200, min(body.top_k, 20),
