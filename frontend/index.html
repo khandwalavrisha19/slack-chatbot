@@ -414,6 +414,26 @@
                    font-family:'DM Sans',sans-serif;font-size:13px;
                    outline:none;transition:border-color .2s,box-shadow .2s;"></textarea>
         </div>
+
+        <div class="field">
+          <label>Date Range <span style="font-weight:400;color:var(--text-muted)">(optional — narrow AI context to a time window)</span></label>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <div style="flex:1;">
+              <div style="font-size:10px;color:var(--text-muted);margin-bottom:3px;text-transform:uppercase;letter-spacing:.04em;">From</div>
+              <input type="date" id="chatFromDate" style="width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px;font-family:'DM Sans',sans-serif;" />
+            </div>
+            <div style="color:var(--text-muted);margin-top:16px;">→</div>
+            <div style="flex:1;">
+              <div style="font-size:10px;color:var(--text-muted);margin-bottom:3px;text-transform:uppercase;letter-spacing:.04em;">To</div>
+              <input type="date" id="chatToDate" style="width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px;font-family:'DM Sans',sans-serif;" />
+            </div>
+            <div style="margin-top:16px;">
+              <button onclick="document.getElementById('chatFromDate').value='';document.getElementById('chatToDate').value='';"
+                style="font-size:11px;padding:5px 10px;color:var(--text-muted);background:transparent;border:1px solid var(--border);border-radius:5px;cursor:pointer;">Clear</button>
+            </div>
+          </div>
+        </div>
+
         <div class="btn-group">
           <button class="primary" id="askBtn" onclick="askChat()">Ask</button>
         </div>
@@ -939,9 +959,12 @@
     try {
       const team_id    = document.getElementById("workspaceSelect").value;
       const question   = document.getElementById("chatQuestion").value.trim();
+      const fromDate   = document.getElementById("chatFromDate").value  || null;
+      const toDate     = document.getElementById("chatToDate").value    || null;
       if (!team_id) { setStatus("Select a workspace first", "warn"); return; }
       if (!question)               { setStatus("Enter a question first", "warn"); return; }
       if (question.length > 500)   { setStatus("Question too long (max 500 chars)", "warn"); return; }
+      if (fromDate && toDate && fromDate > toDate) { setStatus("'From' date must be before 'To' date", "warn"); return; }
 
       const btn = document.getElementById("askBtn");
       btn.disabled    = true;
@@ -955,14 +978,22 @@
         const channelIds = getCheckedChannels("multiChatChannelList");
         if (!channelIds.length) { setStatus("Select at least one channel", "warn"); btn.disabled = false; btn.textContent = "Ask"; return; }
         endpoint = getApiBase() + "/chat/multi";
-        requestBody = JSON.stringify({ team_id, channel_ids: channelIds, question });
-        setStatus("Thinking across " + channelIds.length + " channels…");
+        const payload = { team_id, channel_ids: channelIds, question };
+        if (fromDate) payload.from_date = fromDate;
+        if (toDate)   payload.to_date   = toDate;
+        requestBody = JSON.stringify(payload);
+        const dateRange = fromDate ? ` · ${fromDate}${toDate ? " → " + toDate : "+"}` : "";
+        setStatus("Thinking across " + channelIds.length + " channels" + dateRange + "…");
       } else {
         const channel_id = document.getElementById("channelSelect").value;
         if (!channel_id) { setStatus("Select workspace + channel first", "warn"); btn.disabled = false; btn.textContent = "Ask"; return; }
         endpoint = getApiBase() + "/chat";
-        requestBody = JSON.stringify({ team_id, channel_id, question });
-        setStatus("Thinking…");
+        const payload = { team_id, channel_id, question };
+        if (fromDate) payload.from_date = fromDate;
+        if (toDate)   payload.to_date   = toDate;
+        requestBody = JSON.stringify(payload);
+        const dateRange = fromDate ? ` · ${fromDate}${toDate ? " → " + toDate : "+"}` : "";
+        setStatus("Thinking" + dateRange + "…");
       }
 
       const r = await fetch(endpoint, {
@@ -1046,6 +1077,17 @@
             + '👤 Filtering messages from <strong>@' + data.resolved_username + '</strong></div><br>' + html;
         }
 
+        // Date range badge
+        const chatFrom = document.getElementById("chatFromDate").value;
+        const chatTo   = document.getElementById("chatToDate").value;
+        if (chatFrom || chatTo) {
+          const rangeLabel = chatFrom && chatTo ? chatFrom + " → " + chatTo
+                           : chatFrom ? "From " + chatFrom
+                           : "Until " + chatTo;
+          html = '<div style="font-size:11px;color:#2563eb;margin-bottom:8px;padding:4px 10px;background:rgba(37,99,235,0.07);border-radius:4px;border:1px solid rgba(37,99,235,0.2);display:inline-flex;align-items:center;gap:5px;">'
+            + '📅 Date range: <strong>' + rangeLabel + '</strong></div><br>' + html;
+        }
+
         document.getElementById("chatAnswerText").innerHTML = html;
 
         const citBox = document.getElementById("chatCitations");
@@ -1104,6 +1146,8 @@
     document.getElementById("fromDate").value = "";
     document.getElementById("toDate").value = "";
     document.getElementById("searchUserId").value = "";
+    document.getElementById("chatFromDate").value = "";
+    document.getElementById("chatToDate").value = "";
     show({});
     setStatus("Cleared");
   }
