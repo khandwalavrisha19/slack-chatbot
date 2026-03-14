@@ -580,7 +580,7 @@ def _format_messages(items: list[dict]) -> list[dict]:
             "user_id":         item.get("user_id", "unknown"),
             "username":        item.get("username", ""),
             "text":            text,
-            "snippet":         text[:400] + ("…" if len(text) > 400 else ""),
+            "snippet":         text[:800] + ("…" if len(text) > 800 else ""),  # large enough to capture full messages like "next week..." at the tail
             "channel_id":      item.get("channel_id", ""),
             "team_id":         item.get("team_id", ""),
             "timestamp_human": _ts_human(item.get("ts") or item.get("sk", "")),
