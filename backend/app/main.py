@@ -580,7 +580,7 @@ def _format_messages(items: list[dict]) -> list[dict]:
             "user_id":         item.get("user_id", "unknown"),
             "username":        item.get("username", ""),
             "text":            text,
-            "snippet":         text[:800] + ("…" if len(text) > 800 else ""),  # large enough to capture full messages like "next week..." at the tail
+            "snippet":         text[:1200] + ("…" if len(text) > 1200 else ""),  # 1200 ensures full messages always included (longest typical Slack msg ~800 chars)
             "channel_id":      item.get("channel_id", ""),
             "team_id":         item.get("team_id", ""),
             "timestamp_human": _ts_human(item.get("ts") or item.get("sk", "")),
@@ -1339,7 +1339,8 @@ def api_chat(body: ChatRequest, request: Request, response: Response):
         logger.info("Chat: no messages found", extra={"request_id": request_id, "username": active_username})
         return {"ok": True, "request_id": request_id, "answer": note, "citations": [], "resolved_username": active_username}
 
-    context = "\n".join([f"[{i+1}] {m['timestamp_human']} | {m['username'] or m['user_id']}: {m['snippet']}"
+    # Use full text (not snippet) so no content is ever truncated before the LLM sees it
+    context = "\n".join([f"[{i+1}] {m['timestamp_human']} | {m['username'] or m['user_id']}: {m['text']}"
                          for i, m in enumerate(messages)])
     system_prompt = (
         "You are a precise assistant answering questions ONLY from the Slack messages provided.\n"
@@ -1404,8 +1405,9 @@ def api_chat_multi(body: MultiChatRequest, request: Request, response: Response)
         return {"ok": True, "request_id": request_id, "answer": note, "citations": [],
                 "channels_searched": len(body.channel_ids), "resolved_username": active_username}
 
+    # Use full text (not snippet) so no content is ever truncated before the LLM sees it
     context = "\n".join([
-        f"[{i+1}] {m['timestamp_human']} | #{m.get('channel_id','')} | {m['username'] or m['user_id']}: {m['snippet']}"
+        f"[{i+1}] {m['timestamp_human']} | #{m.get('channel_id','')} | {m['username'] or m['user_id']}: {m['text']}"
         for i, m in enumerate(messages)])
     system_prompt = (
         f"You are a precise assistant answering questions ONLY from Slack messages across {len(body.channel_ids)} channels.\n"
