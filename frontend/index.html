@@ -616,9 +616,10 @@
       </div>`;
     }
 
-    // ── chat summary (after AI answer) ────────────────────────────────────────
+    // ── chat answer (full AI response in output panel) ────────────────────────
     else if (obj.ok && obj.question){
-      html += `<div style="padding:10px 12px;border-radius:8px;background:rgba(155,127,232,0.06);border:1px solid rgba(155,127,232,0.15);">
+      // ── query info header ────────────────────────────────────────────────────
+      html += `<div style="padding:10px 12px;border-radius:8px;background:rgba(155,127,232,0.06);border:1px solid rgba(155,127,232,0.15);margin-bottom:14px;">
         <div style="font-size:11px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px;">Query Info</div>
         <div style="font-size:12px;color:var(--text-soft);margin-bottom:4px;">${esc(obj.question)}</div>
         <div style="display:flex;gap:12px;margin-top:8px;font-size:11px;color:var(--text-muted);">
@@ -626,6 +627,101 @@
           ${obj.channels_searched > 1 ? `<span>🌐 ${obj.channels_searched} channels</span>` : ""}
         </div>
       </div>`;
+
+      if (obj.answer) {
+        var raw = obj.answer;
+
+        function parseSection(text, label) {
+          var lines = text.split("\n");
+          var collecting = false;
+          var result = [];
+          var allLabels = ["answer", "key points", "action items", "citations"];
+          for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            var lineLower = line.toLowerCase();
+            var startsWithLabel = allLabels.some(function(l){ return lineLower.startsWith(l + ":"); });
+            if (lineLower.startsWith(label.toLowerCase() + ":")) {
+              collecting = true;
+              var rest = line.substring(line.indexOf(":") + 1).trim();
+              if (rest) result.push(rest);
+            } else if (collecting && startsWithLabel) {
+              break;
+            } else if (collecting) {
+              result.push(line);
+            }
+          }
+          return result.join("\n").trim();
+        }
+
+        var answerText  = parseSection(raw, "Answer") || raw;
+        var keyPoints   = parseSection(raw, "Key points");
+        var actionItems = parseSection(raw, "Action items");
+        var isWarning   = raw.startsWith("⚠️");
+
+        // Badges row
+        if (obj.resolved_username) {
+          html += `<div style="display:inline-flex;align-items:center;gap:5px;font-size:11px;color:#0d9488;padding:4px 10px;background:rgba(13,148,136,0.07);border-radius:4px;border:1px solid rgba(13,148,136,0.2);margin-bottom:8px;">
+            👤 Filtering messages from <strong>@${esc(obj.resolved_username)}</strong></div>`;
+        }
+        if (obj.channels_searched > 1) {
+          html += `<div style="font-size:11px;color:var(--accent);padding:4px 8px;background:rgba(155,127,232,0.08);border-radius:4px;border:1px solid rgba(155,127,232,0.2);margin-bottom:8px;">
+            🌐 Answer synthesized from <strong>${obj.channels_searched} channels</strong> · ${obj.retrieved || 0} messages reviewed</div>`;
+        }
+
+        // Main answer block
+        html += `<div style="padding:12px 14px;border-radius:8px;background:${isWarning ? 'var(--danger-bg)' : 'var(--surface2)'};border:1px solid ${isWarning ? 'rgba(224,122,138,0.3)' : 'var(--border)'};margin-bottom:12px;">
+          <div style="font-size:11px;font-weight:600;color:${isWarning ? 'var(--danger)' : 'var(--text-muted)'};text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px;">Answer</div>
+          <div style="font-size:13px;color:var(--text);line-height:1.7;">${esc(answerText).split("\n").join("<br>")}</div>
+        </div>`;
+
+        // Key points
+        if (keyPoints && keyPoints.toLowerCase() !== "none" && keyPoints.trim()) {
+          var bullets = keyPoints.split("\n")
+            .map(function(b){ return b.replace(/^[\*\-]\s*/, "").trim(); })
+            .filter(function(b){ return b.length > 0; });
+          if (bullets.length) {
+            html += `<div style="padding:12px 14px;border-radius:8px;background:var(--surface2);border:1px solid var(--border);margin-bottom:12px;">
+              <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px;">Key Points</div>`;
+            bullets.forEach(function(b){
+              html += `<div style="display:flex;gap:8px;margin-bottom:6px;font-size:13px;color:var(--text-soft);">
+                <span style="color:var(--accent);flex-shrink:0;margin-top:1px;">·</span>
+                <span>${esc(b)}</span>
+              </div>`;
+            });
+            html += `</div>`;
+          }
+        }
+
+        // Action items
+        if (actionItems && actionItems.toLowerCase() !== "none" && actionItems.trim()) {
+          html += `<div style="padding:12px 14px;border-radius:8px;background:rgba(155,127,232,0.07);border:1px solid rgba(155,127,232,0.18);margin-bottom:12px;">
+            <div style="font-size:11px;font-weight:600;color:var(--accent);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px;">Action Items</div>
+            <div style="font-size:13px;color:var(--text-soft);line-height:1.65;">${esc(actionItems).split("\n").join("<br>")}</div>
+          </div>`;
+        }
+
+        // Citations / sources
+        if (obj.citations && obj.citations.length > 0) {
+          function stripSlackText(t){
+            return (t||"").replace(/<https?:\/\/[^|>]+\|([^>]+)>/g,"$1")
+              .replace(/<https?:\/\/[^>]+>/g,"[link]")
+              .replace(/[*_]/g,"");
+          }
+          html += `<div style="border-top:1px solid var(--border);padding-top:10px;">
+            <div style="font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px;">Sources (${obj.citations.length})</div>`;
+          obj.citations.forEach(function(c, i){
+            var snippet = esc(stripSlackText(c.snippet || c.text || ""));
+            if (snippet.length > 220) snippet = snippet.slice(0, 220) + "…";
+            html += `<div style="border-left:2px solid var(--accent);padding:7px 10px;margin-bottom:8px;border-radius:0 6px 6px 0;background:var(--surface2);">
+              <div style="font-family:'DM Mono',monospace;font-size:11px;color:var(--text-muted);margin-bottom:4px;">
+                [${i+1}] ${esc(c.timestamp_human||"")} · ${esc(c.username||c.user_id||"unknown")}${c.channel_id ? ' · <span style="color:var(--accent);">#'+esc(c.channel_id)+'</span>' : ''}
+              </div>
+              <div style="font-size:12px;color:var(--text-soft);line-height:1.5;">${snippet}</div>
+            </div>`;
+          });
+          html += `</div>`;
+        }
+      }
     }
 
     // ── generic ok ───────────────────────────────────────────────────────────
@@ -1120,7 +1216,8 @@
         document.getElementById("chatAnswer").style.display = "block";
         const chInfo = data.channels_searched && data.channels_searched > 1 ? ` (${data.channels_searched} channels)` : "";
         setStatus("Answer ready" + chInfo, "ok");
-        show({ ok: true, question: data.question, retrieved: data.retrieved_count, channels_searched: data.channels_searched });      } else {
+        show({ ok: true, question: data.question, answer: data.answer, citations: data.citations, retrieved: data.retrieved_count, channels_searched: data.channels_searched, resolved_username: data.resolved_username });
+      } else {
         setStatus("Chat failed", "err");
       }
     } catch (e) {
