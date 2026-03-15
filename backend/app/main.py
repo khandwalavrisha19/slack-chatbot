@@ -556,8 +556,19 @@ def _score_messages(items: list[dict], q: str) -> list[dict]:
         text = (item.get("text") or "").lower()
         if re.search(r"<@\w+> has (joined|left)", text):
             continue
+        # Base frequency score
         score  = sum(text.count(kw) for kw in keywords)
+        # Bonus: keyword in first 80 chars (subject/headline position)
         score += sum(2 for kw in keywords if kw in text[:80])
+        # Bonus: all keywords appear as a phrase (consecutive)
+        if len(keywords) > 1 and " ".join(keywords) in text:
+            score += 5
+        # Length normalisation: very long messages dilute relevance
+        if len(text) > 800:
+            score = score * 800 / len(text)
+        # Penalty: very short messages (<20 chars) are usually noise
+        if len(text) < 20:
+            score *= 0.5
         if score > 0:
             scored.append((score, item))
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -631,6 +642,12 @@ def retrieve_messages(
     if not _content_keywords(q):
         return _format_messages(items[:top_k])
 
+    # When a specific user is already filtered, skip keyword scoring —
+    # return their messages newest-first. Scoring on user-filtered sets
+    # causes false negatives (e.g. "next week" buried at end of long message).
+    if user_id:
+        return _format_messages(items[:top_k])
+
     matched = _score_messages(items, q)
     # If scoring found nothing, fall back to recency order rather than empty
     if not matched:
@@ -683,8 +700,36 @@ def retrieve_messages_multi(
     return all_items[:top_k]
 
 
+
+
+
+def _build_context(messages: list[dict], channel_prefix: bool = False) -> tuple[str, int]:
+    """
+    Build the LLM context string from retrieved messages.
+    Uses full message text and stops at CONTEXT_MAX_CHARS to control token cost.
+    Returns (context_string, messages_included_count).
+    """
+    lines: list[str] = []
+    total = 0
+    for i, m in enumerate(messages):
+        text = (m.get("text") or "").strip()
+        who  = m.get("username") or m.get("user_id") or "unknown"
+        ch   = f" | #{m.get('channel_id','')}" if channel_prefix and m.get("channel_id") else ""
+        line = f"[{i+1}] {m.get('timestamp_human','')} | {who}{ch}: {text}"
+        if total + len(line) > CONTEXT_MAX_CHARS:
+            break
+        lines.append(line)
+        total += len(line) + 1
+    return "\n".join(lines), len(lines)
+
+
 GROQ_TIMEOUT_CONNECT = 5   # seconds to establish connection
 GROQ_TIMEOUT_READ    = 30  # seconds to read response
+
+# ── TOKEN / COST CONTROL ─────────────────────────────────────────────────────
+CONTEXT_MAX_CHARS = 8_000  # hard cap on total context string sent to LLM
+MAX_TOKENS_SINGLE = 768    # max output tokens for /api/chat    (was 1024)
+MAX_TOKENS_MULTI  = 900    # max output tokens for /api/chat/multi (was 1500)
 
 def _groq_complete(prompt: str, max_tokens: int = 1024, system: Optional[str] = None) -> str:
     """
@@ -719,14 +764,14 @@ def _groq_complete(prompt: str, max_tokens: int = 1024, system: Optional[str] = 
     except requests.exceptions.ConnectTimeout:
         elapsed = round(time.time() - start, 2)
         logger.error("Groq connect timeout", extra={"request_id": request_id, "elapsed_s": elapsed})
-        return "⚠️ The AI service took too long to connect. Please try again in a moment."
+        return "⚠️ The AI service took too long to connect. Please try again in a moment.", 0
     except requests.exceptions.ReadTimeout:
         elapsed = round(time.time() - start, 2)
         logger.error("Groq read timeout", extra={"request_id": request_id, "elapsed_s": elapsed})
-        return "⚠️ The AI service timed out while generating a response. Try a shorter question or smaller date range."
+        return "⚠️ The AI service timed out while generating a response. Try a shorter question or smaller date range.", 0
     except requests.exceptions.RequestException as exc:
         logger.error("Groq network error", extra={"request_id": request_id, "error": str(exc)})
-        return "⚠️ Could not reach the AI service due to a network error. Please try again."
+        return "⚠️ Could not reach the AI service due to a network error. Please try again.", 0
 
     elapsed = round(time.time() - start, 2)
 
@@ -734,23 +779,24 @@ def _groq_complete(prompt: str, max_tokens: int = 1024, system: Optional[str] = 
         data = resp.json()
     except ValueError:
         logger.error("Groq non-JSON response", extra={"request_id": request_id, "status": resp.status_code})
-        return "⚠️ Received an unexpected response from the AI service."
+        return "⚠️ Received an unexpected response from the AI service.", 0
 
     if resp.status_code == 429:
         logger.warning("Groq rate limited", extra={"request_id": request_id})
-        return "⚠️ The AI service is currently rate-limited. Please wait a few seconds and try again."
+        return "⚠️ The AI service is currently rate-limited. Please wait a few seconds and try again.", 0
 
     if resp.status_code >= 500:
         logger.error("Groq 5xx error", extra={"request_id": request_id, "status": resp.status_code})
-        return "⚠️ The AI service returned a server error. Please try again shortly."
+        return "⚠️ The AI service returned a server error. Please try again shortly.", 0
 
     if resp.status_code != 200:
         logger.error("Groq unexpected status", extra={"request_id": request_id, "status": resp.status_code, "body": str(data)[:200]})
         raise HTTPException(502, f"Groq error {resp.status_code}: {data}")
 
     answer = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-    logger.info("Groq call succeeded", extra={"request_id": request_id, "elapsed_s": elapsed, "tokens": data.get("usage", {}).get("total_tokens")})
-    return answer
+    tokens_used = (data.get("usage") or {}).get("total_tokens", 0)
+    logger.info("Groq call succeeded", extra={"request_id": request_id, "elapsed_s": elapsed, "tokens": tokens_used})
+    return answer, tokens_used
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1339,9 +1385,9 @@ def api_chat(body: ChatRequest, request: Request, response: Response):
         logger.info("Chat: no messages found", extra={"request_id": request_id, "username": active_username})
         return {"ok": True, "request_id": request_id, "answer": note, "citations": [], "resolved_username": active_username}
 
-    # Use full text (not snippet) so no content is ever truncated before the LLM sees it
-    context = "\n".join([f"[{i+1}] {m['timestamp_human']} | {m['username'] or m['user_id']}: {m['text']}"
-                         for i, m in enumerate(messages)])
+    context, ctx_count = _build_context(messages, channel_prefix=False)
+    logger.info("Context built", extra={"request_id": request_id,
+                "ctx_messages": ctx_count, "ctx_chars": len(context)})
     system_prompt = (
         "You are a precise assistant answering questions ONLY from the Slack messages provided.\n"
         "Rules:\n"
@@ -1357,7 +1403,7 @@ def api_chat(body: ChatRequest, request: Request, response: Response):
         "Citations: <[1], [2] etc>"
     )
     user_prompt = f"SLACK MESSAGES:\n{context}\n\nQUESTION: {body.question}"
-    answer_text   = _groq_complete(user_prompt, 1024, system=system_prompt)
+    answer_text, tokens_used = _groq_complete(user_prompt, MAX_TOKENS_SINGLE, system=system_prompt)
     cited_indices = [int(n)-1 for n in re.findall(r"\[(\d+)\]", answer_text) if n.isdigit() and 0 < int(n) <= len(messages)]
     citations     = [messages[i] for i in dict.fromkeys(cited_indices)]
 
@@ -1369,7 +1415,8 @@ def api_chat(body: ChatRequest, request: Request, response: Response):
     })
     return {"ok": True, "request_id": request_id, "question": body.question, "answer": answer_text,
             "citations": citations, "retrieved_count": len(messages),
-            "resolved_username": active_username}
+            "resolved_username": active_username,
+            "tokens_used": tokens_used, "ctx_messages": ctx_count}
 
 
 @app.post("/api/chat/multi")
@@ -1405,10 +1452,9 @@ def api_chat_multi(body: MultiChatRequest, request: Request, response: Response)
         return {"ok": True, "request_id": request_id, "answer": note, "citations": [],
                 "channels_searched": len(body.channel_ids), "resolved_username": active_username}
 
-    # Use full text (not snippet) so no content is ever truncated before the LLM sees it
-    context = "\n".join([
-        f"[{i+1}] {m['timestamp_human']} | #{m.get('channel_id','')} | {m['username'] or m['user_id']}: {m['text']}"
-        for i, m in enumerate(messages)])
+    context, ctx_count = _build_context(messages, channel_prefix=True)
+    logger.info("Multi context built", extra={"request_id": request_id,
+                "ctx_messages": ctx_count, "ctx_chars": len(context)})
     system_prompt = (
         f"You are a precise assistant answering questions ONLY from Slack messages across {len(body.channel_ids)} channels.\n"
         "Rules:\n"
@@ -1424,7 +1470,7 @@ def api_chat_multi(body: MultiChatRequest, request: Request, response: Response)
         "Citations: <[1], [2] etc>"
     )
     user_prompt = f"SLACK MESSAGES:\n{context}\n\nQUESTION: {body.question}"
-    answer_text   = _groq_complete(user_prompt, 1500, system=system_prompt)
+    answer_text, tokens_used = _groq_complete(user_prompt, MAX_TOKENS_MULTI, system=system_prompt)
     cited_indices = [int(n)-1 for n in re.findall(r"\[(\d+)\]", answer_text) if n.isdigit() and 0 < int(n) <= len(messages)]
     citations     = [messages[i] for i in dict.fromkeys(cited_indices)]
 
@@ -1437,7 +1483,8 @@ def api_chat_multi(body: MultiChatRequest, request: Request, response: Response)
     })
     return {"ok": True, "request_id": request_id, "question": body.question, "answer": answer_text,
             "citations": citations, "retrieved_count": len(messages),
-            "channels_searched": len(body.channel_ids), "resolved_username": active_username}
+            "channels_searched": len(body.channel_ids), "resolved_username": active_username,
+            "tokens_used": tokens_used, "ctx_messages": ctx_count}
 
 
 handler = Mangum(app)
