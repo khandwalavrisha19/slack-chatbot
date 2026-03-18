@@ -316,10 +316,14 @@
             <option value="">— Load channels first —</option>
           </select>
         </div>
-        <div class="btn-group">
-          <button onclick="joinSelectedAndBackfill()">Join + Backfill</button>
-          <button onclick="joinAllAndBackfill()">Join All Public</button>
-          <button onclick="loadMessagesFromDB()">Load from DB</button>
+        <div class="btn-group" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;">
+          <button onclick="joinSelectedAndBackfill()" title="Join the selected channel and backfill its messages into DB">Join + Backfill</button>
+          <button onclick="joinAllPublicOnly()" title="Join all public channels (no backfill)">Join All Public</button>
+          <button onclick="backfillAllPublic()" title="Backfill messages from all public channels the bot has joined">Backfill Public</button>
+          <button onclick="backfillAllPrivate()" title="Backfill messages from all private channels the bot has been invited to">Backfill Private</button>
+        </div>
+        <div style="margin-top:2px;">
+          <button onclick="loadMessagesFromDB()" style="width:100%;">Load from DB</button>
         </div>
       </div>
     </div>
@@ -870,6 +874,40 @@
       }
       show({ join_all:j, backfill_all:{ total_stored: total, results } });
       setStatus("Done — " + total + " total stored", "ok");
+    }catch(e){ show({ok:false, error:String(e)}); setStatus("Failed", "err"); }
+  }
+
+  async function joinAllPublicOnly(){
+    try{
+      const team_id = document.getElementById("workspaceSelect").value;
+      if(!team_id){ setStatus("Select a workspace first", "warn"); return; }
+      setStatus("Joining all public channels…");
+      const j = await fetchJson(getApiBase() + "/join-all-public?team_id=" + encodeURIComponent(team_id), { method:"POST" });
+      show(j);
+      setStatus(j.ok ? ("Joined " + (j.joined_count||0) + " public channels") : "Join failed", j.ok ? "ok" : "err");
+      if(j.ok) await loadChannels();
+    }catch(e){ show({ok:false, error:String(e)}); setStatus("Failed", "err"); }
+  }
+
+  async function backfillAllPublic(){
+    try{
+      const team_id = document.getElementById("workspaceSelect").value;
+      if(!team_id){ setStatus("Select a workspace first", "warn"); return; }
+      setStatus("Backfilling all public channels…");
+      const data = await fetchJson(getApiBase() + "/backfill-all-public?team_id=" + encodeURIComponent(team_id), { method:"POST" });
+      show({ backfill_all: data });
+      setStatus(data.ok ? ("Done — " + (data.total_stored||0) + " stored") : "Backfill failed", data.ok ? "ok" : "err");
+    }catch(e){ show({ok:false, error:String(e)}); setStatus("Failed", "err"); }
+  }
+
+  async function backfillAllPrivate(){
+    try{
+      const team_id = document.getElementById("workspaceSelect").value;
+      if(!team_id){ setStatus("Select a workspace first", "warn"); return; }
+      setStatus("Backfilling all private channels…");
+      const data = await fetchJson(getApiBase() + "/backfill-all-private?team_id=" + encodeURIComponent(team_id), { method:"POST" });
+      show({ backfill_all: data });
+      setStatus(data.ok ? ("Done — " + (data.total_stored||0) + " stored") : "Backfill failed", data.ok ? "ok" : "err");
     }catch(e){ show({ok:false, error:String(e)}); setStatus("Failed", "err"); }
   }
 

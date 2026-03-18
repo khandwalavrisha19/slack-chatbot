@@ -1138,6 +1138,99 @@ def backfill_channel(team_id: str, channel_id: str, request: Request, limit: int
             "stored_new": stored, "next_cursor": next_cursor, "has_more": bool(next_cursor)}
 
 
+# ── BACKFILL ALL PUBLIC ───────────────────────────────────────────────────────
+
+@app.post("/backfill-all-public")
+@app.post("/api/backfill-all-public")
+def backfill_all_public(team_id: str, request: Request):
+    require_ddb()
+    require_team_access(request, team_id)
+    sec = read_secret(secret_name(team_id))
+    if not sec or not sec.get("bot_token"):
+        return {"ok": False, "message": "bot_token missing"}
+    # Collect all public channels the bot is already a member of
+    all_channels, cursor = [], None
+    while True:
+        params = {"limit": 200, "types": "public_channel", "exclude_archived": "true"}
+        if cursor:
+            params["cursor"] = cursor
+        lst = requests.get("https://slack.com/api/conversations.list",
+                           headers={"Authorization": f"Bearer {sec['bot_token']}"},
+                           params=params, timeout=20).json()
+        if not lst.get("ok"):
+            return {"ok": False, "slack_error": lst}
+        for ch in lst.get("channels", []):
+            if ch.get("is_member"):
+                all_channels.append(ch["id"])
+        cursor = (lst.get("response_metadata") or {}).get("next_cursor") or ""
+        if not cursor:
+            break
+    total_stored, results = 0, []
+    for ch_id in all_channels:
+        bf_cursor, stored, ok = "", 0, True
+        while True:
+            bf = backfill_channel(team_id=team_id, channel_id=ch_id, request=request,
+                                   limit=200, cursor=bf_cursor if bf_cursor else None)
+            if not bf.get("ok"):
+                ok = False
+                break
+            stored += bf.get("stored_new", 0)
+            if not bf.get("has_more"):
+                break
+            bf_cursor = bf.get("next_cursor", "")
+        results.append({"channel": ch_id, "ok": ok, "stored": stored})
+        if ok:
+            total_stored += stored
+    return {"ok": True, "total_stored": total_stored, "results": results}
+
+
+# ── BACKFILL ALL PRIVATE ──────────────────────────────────────────────────────
+
+@app.post("/backfill-all-private")
+@app.post("/api/backfill-all-private")
+def backfill_all_private(team_id: str, request: Request):
+    require_ddb()
+    require_team_access(request, team_id)
+    sec = read_secret(secret_name(team_id))
+    if not sec or not sec.get("bot_token"):
+        return {"ok": False, "message": "bot_token missing"}
+    # Collect all private channels the bot is already a member of
+    all_channels, cursor = [], None
+    while True:
+        params = {"limit": 200, "types": "private_channel", "exclude_archived": "true"}
+        if cursor:
+            params["cursor"] = cursor
+        lst = requests.get("https://slack.com/api/conversations.list",
+                           headers={"Authorization": f"Bearer {sec['bot_token']}"},
+                           params=params, timeout=20).json()
+        if not lst.get("ok"):
+            return {"ok": False, "slack_error": lst}
+        for ch in lst.get("channels", []):
+            if ch.get("is_member"):
+                all_channels.append(ch["id"])
+        cursor = (lst.get("response_metadata") or {}).get("next_cursor") or ""
+        if not cursor:
+            break
+    total_stored, results = 0, []
+    for ch_id in all_channels:
+        bf_cursor, stored = "", 0
+        ok = True
+        while True:
+            bf = backfill_channel(team_id=team_id, channel_id=ch_id, request=request,
+                                   limit=200, cursor=bf_cursor if bf_cursor else None)
+            if not bf.get("ok"):
+                ok = False
+                break
+            stored += bf.get("stored_new", 0)
+            if not bf.get("has_more"):
+                break
+            bf_cursor = bf.get("next_cursor", "")
+        results.append({"channel": ch_id, "ok": ok, "stored": stored})
+        if ok:
+            total_stored += stored
+    return {"ok": True, "total_stored": total_stored, "results": results}
+
+
 # ── SLACK EVENTS WEBHOOK (no session — uses Slack signing secret) ─────────────
 
 @app.post("/slack/events")
