@@ -581,7 +581,7 @@ def _score_messages(items: list[dict], q: str) -> list[dict]:
         if score > 0:
             scored.append((score, item))
     scored.sort(key=lambda x: x[0], reverse=True)
-    result = [item for _, item in scored]
+    result = [item for score, item in scored if score > 0] 
 
     # Mixed query ("last message and what was it about") — after content scoring,
     # sort by timestamp so the most recent match surfaces first
@@ -658,10 +658,7 @@ def retrieve_messages(
         return _format_messages(items[:top_k])
 
     matched = _score_messages(items, q)
-    # If scoring found nothing, fall back to recency order rather than empty
-    if not matched:
-        return _format_messages(items[:top_k])
-    return _format_messages(matched[:top_k])
+    return _format_messages(matched[:top_k]) 
 
 
 def retrieve_messages_multi(
@@ -671,7 +668,7 @@ def retrieve_messages_multi(
     limit: int = 200, top_k: int = 10,
     username: Optional[str] = None, bot_token: Optional[str] = None,
 ) -> list[dict]:
-    # Resolve username once up-front so every channel uses the same user_id
+    # Resolve username once up-front
     if username and not user_id and bot_token:
         resolved = resolve_user_id(team_id, username, bot_token)
         if resolved:
@@ -680,33 +677,63 @@ def retrieve_messages_multi(
             logger.info(f"[retrieve_multi] username '{username}' not found in workspace {team_id}")
             return []
 
-    all_items: list[dict] = []
+    # ── Collect raw DDB items across all channels ─────────────────────────────
+    all_raw: list[dict] = []
     for channel_id in channel_ids:
+        pk       = f"{team_id}#{channel_id}"
+        key_expr = Key("pk").eq(pk)
+        if from_date and to_date:
+            key_expr = key_expr & Key("sk").between(_date_to_sk(from_date), _date_to_sk(to_date, end_of_day=True))
+        elif from_date:
+            key_expr = key_expr & Key("sk").gte(_date_to_sk(from_date))
+        elif to_date:
+            key_expr = key_expr & Key("sk").lte(_date_to_sk(to_date, end_of_day=True))
+        kwargs = {"KeyConditionExpression": key_expr, "Limit": limit, "ScanIndexForward": False}
+        if user_id:
+            kwargs["FilterExpression"] = Attr("user_id").eq(user_id)
         try:
-            msgs = retrieve_messages(team_id, channel_id, q, from_date, to_date, user_id, limit, top_k * 3)
-            all_items.extend(msgs)
-        except Exception:
-            pass
-    if not all_items:
+            resp = ddb_table.query(**kwargs)
+            items = resp.get("Items", [])
+            # filter join/leave noise
+            items = [i for i in items if not re.search(
+                r"<@\w+> has (joined|left)", (i.get("text") or "").lower())]
+            all_raw.extend(items)
+        except Exception as e:
+            logger.warning(f"[retrieve_multi] DDB query failed for {channel_id}: {e}")
+
+    if not all_raw:
         return []
-    if q and q.strip():
-        content_kws = _content_keywords(q)
-        if content_kws:
-            def score(m):
-                text = (m.get("text") or "").lower()
-                s  = sum(text.count(kw) for kw in content_kws)
-                s += sum(2 for kw in content_kws if kw in text[:80])
-                return s
-            all_items.sort(key=score, reverse=True)
-            # Mixed recency+content query — also sort by time so newest surfaces first
-            if _is_recency_query(q):
-                all_items.sort(key=lambda m: m.get("message_ts", ""), reverse=True)
-        else:
-            # Pure recency — newest first
-            all_items.sort(key=lambda m: m.get("message_ts", ""), reverse=True)
+
+    content_kws = _content_keywords(q) if q and q.strip() else []
+
+    if content_kws:
+        # Score ALL raw items globally — only keep items with score > 0
+        scored_pool = []
+        for item in all_raw:
+            text = (item.get("text") or "").lower()
+            score  = sum(text.count(kw) for kw in content_kws)
+            score += sum(2 for kw in content_kws if kw in text[:80])
+            if len(content_kws) > 1 and " ".join(content_kws) in text:
+                score += 5
+            if len(text) > 800:
+                score = score * 800 / len(text)
+            if len(text) < 20:
+                score *= 0.5
+            if score > 0:  # ← hard filter: zero-score items are excluded
+                scored_pool.append((score, item))
+
+        scored_pool.sort(key=lambda x: x[0], reverse=True)
+        # Mixed recency+content: also sort by time so newest match surfaces first
+        if _is_recency_query(q):
+            scored_pool.sort(key=lambda x: x[1].get("sk") or x[1].get("ts") or "", reverse=True)
+
+        top_items = [item for _, item in scored_pool[:top_k]]
     else:
-        all_items.sort(key=lambda m: m.get("message_ts", ""), reverse=True)
-    return all_items[:top_k]
+        # Pure recency query — newest first, no content filter needed
+        all_raw.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
+        top_items = all_raw[:top_k]
+
+    return _format_messages(top_items)
 
 
 
