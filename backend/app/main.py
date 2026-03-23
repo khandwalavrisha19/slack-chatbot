@@ -7,6 +7,7 @@ import hmac
 import hashlib
 import logging
 import sys
+from collections import defaultdict
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional
@@ -56,9 +57,11 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger: StructuredLogger = logging.getLogger(__name__)  # type: ignore[assignment]
 
 # ── REQUEST SIZE LIMITS ───────────────────────────────────────────────────────
-MAX_BODY_BYTES = 64 * 1024          # 64 KB hard limit for all POST bodies
-MAX_QUESTION_LEN = 1_000            # chars
-MAX_CHANNEL_IDS = 20                # max channels in multi-chat/search
+MAX_BODY_BYTES   = 64 * 1024   # 64 KB hard limit for all POST bodies
+MAX_QUESTION_LEN = 1_000       # chars
+MAX_CHANNEL_IDS  = 20          # max channels in multi-chat/search
+MAX_QUERY_LEN    = 200         # chars for keyword search
+MAX_USERNAME_LEN = 50          # chars for username filter
 
 # ── ENV CONFIG ────────────────────────────────────────────────────────────────
 AWS_REGION           = os.getenv("AWS_REGION", "ap-south-1").strip()
@@ -70,7 +73,7 @@ SLACK_SCOPES         = os.getenv(
     "SLACK_SCOPES",
     "channels:history,chat:write,users:read,groups:history,channels:read,groups:read,channels:join",
 ).strip()
-CORS_ORIGINS         = os.getenv("CORS_ORIGINS", "*")
+CORS_ORIGINS         = os.getenv("CORS_ORIGINS", "").strip()
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "").strip()
 DDB_TABLE            = os.getenv("DDB_TABLE", "").strip()
 SESSIONS_TABLE       = os.getenv("SESSIONS_TABLE", "slackbot_sessions").strip()
@@ -82,7 +85,16 @@ SESSION_COOKIE_NAME  = "sb_session"
 SESSION_TTL_HOURS    = 72
 IS_PROD              = os.getenv("ENV", "dev").strip().lower() == "prod"
 
-origins = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()] or ["*"]
+# ── CORS ORIGINS ──────────────────────────────────────────────────────────────
+# Set CORS_ORIGINS env var to your CloudFront domain(s), comma-separated.
+# Example: https://xxxx.cloudfront.net  or  https://xxxx.cloudfront.net,https://yourdomain.com
+def _build_cors_origins() -> list[str]:
+    if not CORS_ORIGINS:
+        logger.warning("CORS_ORIGINS not set — all cross-origin requests will be blocked")
+        return []
+    return [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
+
+origins = _build_cors_origins()
 
 app = FastAPI(title="Slackbot Full MVP")
 
@@ -101,6 +113,34 @@ async def limit_request_size(request: Request, call_next):
             content={"ok": False, "error": f"Request body exceeds {MAX_BODY_BYTES // 1024} KB limit"},
         )
     return await call_next(request)
+
+# ── SECURITY HEADERS MIDDLEWARE ───────────────────────────────────────────────
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    # Prevent MIME-type sniffing
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    # Prevent clickjacking via iframes
+    response.headers["X-Frame-Options"] = "DENY"
+    # Don't leak referrer info to third parties
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # Disable browser features you don't use
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    # Force HTTPS in production
+    if IS_PROD:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    # Content Security Policy
+    # 'unsafe-inline' is required because index.html uses inline <style> and <script>
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; "
+        "font-src 'self' https://fonts.gstatic.com; "
+        "connect-src 'self' https://api.groq.com; "
+        "img-src 'self' data:; "
+        "frame-ancestors 'none';"
+    )
+    return response
 
 # ── GLOBAL EXCEPTION HANDLERS ─────────────────────────────────────────────────
 @app.exception_handler(RequestValidationError)
@@ -143,10 +183,11 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins if origins != ["*"] else ["*"],
+    allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Requested-With"],
+    max_age=600,
 )
 
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
@@ -156,6 +197,32 @@ sessions_table = dynamodb.Table(SESSIONS_TABLE) if SESSIONS_TABLE else None
 
 frontend_default = Path(__file__).with_name("index.html")
 FRONTEND_PATH    = Path(os.getenv("FRONTEND_PATH", str(frontend_default)))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RATE LIMITING
+# ═══════════════════════════════════════════════════════════════════════════════
+# In-memory sliding window. Resets on Lambda cold start — good enough for
+# protecting against abuse. Chat and search have separate limits.
+
+_rate_store: dict = defaultdict(list)
+RATE_LIMIT_CHAT   = 30   # max Ask AI requests per session per minute
+RATE_LIMIT_SEARCH = 60   # max Search requests per session per minute
+RATE_WINDOW_SECS  = 60   # rolling window in seconds
+
+def _check_rate_limit(session_id: str, action: str, limit: int) -> None:
+    key = f"{session_id}:{action}"
+    now = time.time()
+    _rate_store[key] = [t for t in _rate_store[key] if now - t < RATE_WINDOW_SECS]
+    if len(_rate_store[key]) >= limit:
+        logger.warning("Rate limit hit", extra={
+            "session_id": session_id[:8],
+            "action": action,
+            "count": len(_rate_store[key]),
+            "limit": limit,
+        })
+        raise HTTPException(429, "Too many requests — please wait a moment before trying again")
+    _rate_store[key].append(now)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -229,6 +296,62 @@ def _ts_human(ts: str) -> str:
         return datetime.utcfromtimestamp(float(str(ts).split(".")[0])).strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         return str(ts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INPUT SANITIZATION & VALIDATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Prompt injection patterns — questions matching these are rejected
+_INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+)?(previous|above|prior)\s+instructions",
+    r"disregard\s+(your\s+)?(previous\s+)?rules",
+    r"you\s+are\s+now\s+a",
+    r"act\s+as\s+(a\s+|an\s+)?(?!slack)",
+    r"new\s+system\s+prompt",
+    r"forget\s+(everything|all|your)",
+    r"reveal\s+(your\s+)?(system\s+)?prompt",
+    r"print\s+(your\s+)?(system\s+)?prompt",
+    r"what\s+(are\s+)?your\s+instructions",
+    r"override\s+(your\s+)?instructions",
+]
+_INJECTION_RE = re.compile("|".join(_INJECTION_PATTERNS), re.IGNORECASE)
+
+
+def _sanitize_text(v: str, field_name: str, max_len: int) -> str:
+    """Strip whitespace, remove null bytes, enforce length limit."""
+    if v is None:
+        return v
+    v = v.strip().replace("\x00", "")
+    if len(v) > max_len:
+        raise ValueError(f"{field_name} is too long (max {max_len} characters)")
+    return v
+
+
+def _check_prompt_injection(question: str) -> None:
+    """Raise 400 if the question looks like a prompt injection attempt."""
+    if _INJECTION_RE.search(question):
+        logger.warning("Prompt injection attempt blocked", extra={
+            "question_preview": question[:80]
+        })
+        raise HTTPException(400, "Invalid question format")
+
+
+def _validate_search_query(v: Optional[str]) -> Optional[str]:
+    """Validate and sanitize the keyword search query."""
+    if v is None:
+        return v
+    return _sanitize_text(v, "Search query", MAX_QUERY_LEN)
+
+
+def _validate_username_param(v: Optional[str]) -> Optional[str]:
+    """Validate username filter — allow only safe characters."""
+    if v is None:
+        return v
+    v = _sanitize_text(v, "Username", MAX_USERNAME_LEN)
+    if v and not re.match(r"^[A-Za-z0-9._\- ]+$", v):
+        raise ValueError("Username contains invalid characters")
+    return v
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -327,7 +450,6 @@ def resolve_user_id(team_id: str, username: str, bot_token: str) -> Optional[str
             rn      = (profile.get("real_name")    or "").strip()
             if uid:
                 upsert_cached_user(team_id, uid, dn, rn)
-                # check match while we iterate
                 if matched_id is None:
                     dn_l = dn.lower()
                     rn_l = rn.lower()
@@ -353,7 +475,6 @@ def resolve_username_for_message(team_id: str, user_id: str, bot_token: str) -> 
     if cached:
         return cached.get("display_name") or cached.get("real_name") or user_id
 
-    # single-user fallback
     try:
         r    = requests.get(
             "https://slack.com/api/users.info",
@@ -554,8 +675,6 @@ def _content_keywords(q: str) -> list[str]:
 def _score_messages(items: list[dict], q: str) -> list[dict]:
     keywords = _content_keywords(q)
 
-    # Pure recency query ("who sent the last message") — no content to score,
-    # items are already newest-first from DynamoDB, just filter join/leave noise
     if not keywords:
         return [i for i in items
                 if not re.search(r"<@\w+> has (joined|left)", (i.get("text") or "").lower())]
@@ -565,26 +684,19 @@ def _score_messages(items: list[dict], q: str) -> list[dict]:
         text = (item.get("text") or "").lower()
         if re.search(r"<@\w+> has (joined|left)", text):
             continue
-        # Base frequency score
         score  = sum(text.count(kw) for kw in keywords)
-        # Bonus: keyword in first 80 chars (subject/headline position)
         score += sum(2 for kw in keywords if kw in text[:80])
-        # Bonus: all keywords appear as a phrase (consecutive)
         if len(keywords) > 1 and " ".join(keywords) in text:
             score += 5
-        # Length normalisation: very long messages dilute relevance
         if len(text) > 800:
             score = score * 800 / len(text)
-        # Penalty: very short messages (<20 chars) are usually noise
         if len(text) < 20:
             score *= 0.5
         if score > 0:
             scored.append((score, item))
     scored.sort(key=lambda x: x[0], reverse=True)
-    result = [item for score, item in scored if score > 0] 
+    result = [item for score, item in scored if score > 0]
 
-    # Mixed query ("last message and what was it about") — after content scoring,
-    # sort by timestamp so the most recent match surfaces first
     if _is_recency_query(q) and result:
         result.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
 
@@ -600,7 +712,7 @@ def _format_messages(items: list[dict]) -> list[dict]:
             "user_id":         item.get("user_id", "unknown"),
             "username":        item.get("username", ""),
             "text":            text,
-            "snippet":         text[:1200] + ("…" if len(text) > 1200 else ""),  # 1200 ensures full messages always included (longest typical Slack msg ~800 chars)
+            "snippet":         text[:1200] + ("…" if len(text) > 1200 else ""),
             "channel_id":      item.get("channel_id", ""),
             "team_id":         item.get("team_id", ""),
             "timestamp_human": _ts_human(item.get("ts") or item.get("sk", "")),
@@ -617,13 +729,11 @@ def retrieve_messages(
 ) -> list[dict]:
     require_ddb()
 
-    # ── Resolve username → user_id if caller supplied a name ─────────────────
     if username and not user_id and bot_token:
         resolved = resolve_user_id(team_id, username, bot_token)
         if resolved:
             user_id = resolved
         else:
-            # No match found — return empty rather than ignoring the filter
             logger.info(f"[retrieve] username '{username}' not found in workspace {team_id}")
             return []
 
@@ -647,18 +757,14 @@ def retrieve_messages(
     if not q or not q.strip():
         return _format_messages(items[:top_k])
 
-    # Pure recency query — skip scoring, items already newest-first from DynamoDB
     if not _content_keywords(q):
         return _format_messages(items[:top_k])
 
-    # When a specific user is already filtered, skip keyword scoring —
-    # return their messages newest-first. Scoring on user-filtered sets
-    # causes false negatives (e.g. "next week" buried at end of long message).
     if user_id:
         return _format_messages(items[:top_k])
 
     matched = _score_messages(items, q)
-    return _format_messages(matched[:top_k]) 
+    return _format_messages(matched[:top_k])
 
 
 def retrieve_messages_multi(
@@ -676,7 +782,6 @@ def retrieve_messages_multi(
             logger.info(f"[retrieve_multi] username '{username}' not found in workspace {team_id}")
             return []
 
-    # ── Collect raw DDB items across all channels ─────────────────────────────
     all_raw: list[dict] = []
     for channel_id in channel_ids:
         pk       = f"{team_id}#{channel_id}"
@@ -693,7 +798,6 @@ def retrieve_messages_multi(
         try:
             resp = ddb_table.query(**kwargs)
             items = resp.get("Items", [])
-            # filter join/leave noise
             items = [i for i in items if not re.search(
                 r"<@\w+> has (joined|left)", (i.get("text") or "").lower())]
             all_raw.extend(items)
@@ -703,10 +807,6 @@ def retrieve_messages_multi(
     if not all_raw:
         return []
 
-    # When a specific user is already filtered, skip keyword scoring —
-    # return their messages newest-first. Scoring on user-filtered sets
-    # causes false negatives (e.g. "summarize messages from @user" has
-    # keywords like "summarize"/"messages" that never appear in message text).
     if user_id:
         all_raw.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
         return _format_messages(all_raw[:top_k])
@@ -714,7 +814,6 @@ def retrieve_messages_multi(
     content_kws = _content_keywords(q) if q and q.strip() else []
 
     if content_kws:
-        # Score ALL raw items globally — only keep items with score > 0
         scored_pool = []
         for item in all_raw:
             text = (item.get("text") or "").lower()
@@ -726,24 +825,19 @@ def retrieve_messages_multi(
                 score = score * 800 / len(text)
             if len(text) < 20:
                 score *= 0.5
-            if score > 0:  # ← hard filter: zero-score items are excluded
+            if score > 0:
                 scored_pool.append((score, item))
 
         scored_pool.sort(key=lambda x: x[0], reverse=True)
-        # Mixed recency+content: also sort by time so newest match surfaces first
         if _is_recency_query(q):
             scored_pool.sort(key=lambda x: x[1].get("sk") or x[1].get("ts") or "", reverse=True)
 
         top_items = [item for _, item in scored_pool[:top_k]]
     else:
-        # Pure recency query — newest first, no content filter needed
         all_raw.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
         top_items = all_raw[:top_k]
 
     return _format_messages(top_items)
-
-
-
 
 
 def _build_context(messages: list[dict], channel_prefix: bool = False) -> tuple[str, int]:
@@ -766,17 +860,15 @@ def _build_context(messages: list[dict], channel_prefix: bool = False) -> tuple[
     return "\n".join(lines), len(lines)
 
 
-
 def _augment_question_with_senders(question: str, messages: list[dict]) -> str:
     """
     If the question asks WHO, extract unique sender names from the
     retrieved messages and inject them directly into the question.
-    This removes any reliance on the LLM to figure out the sender itself.
     """
     who_words = {"who", "whose", "whom"}
     q_words = set(question.lower().split())
     if not (q_words & who_words):
-        return question  # question doesn't ask about WHO, leave unchanged
+        return question
 
     senders = []
     seen = set()
@@ -790,7 +882,6 @@ def _augment_question_with_senders(question: str, messages: list[dict]) -> str:
         return question
 
     sender_str = ", ".join(senders)
-    # Append sender context directly to the question so LLM can't miss it
     return f"{question} [NOTE: The message(s) were sent by: {sender_str}. You MUST name them in your answer.]"
 
 
@@ -799,8 +890,8 @@ GROQ_TIMEOUT_READ    = 30  # seconds to read response
 
 # ── TOKEN / COST CONTROL ─────────────────────────────────────────────────────
 CONTEXT_MAX_CHARS = 8_000  # hard cap on total context string sent to LLM
-MAX_TOKENS_SINGLE = 768    # max output tokens for /api/chat    (was 1024)
-MAX_TOKENS_MULTI  = 900    # max output tokens for /api/chat/multi (was 1500)
+MAX_TOKENS_SINGLE = 768    # max output tokens for /api/chat
+MAX_TOKENS_MULTI  = 900    # max output tokens for /api/chat/multi
 
 def _groq_complete(prompt: str, max_tokens: int = 1024, system: Optional[str] = None) -> str:
     """
@@ -958,7 +1049,6 @@ def oauth_callback(
     except Exception as e:
         return _err(str(e))
 
-    # Bind team to current session (or create a new one)
     cookie_val = request.cookies.get(SESSION_COOKIE_NAME)
     if cookie_val and get_session(cookie_val):
         bind_team_to_session(cookie_val, team_id)
@@ -1182,7 +1272,6 @@ def backfill_all_public(team_id: str, request: Request):
     sec = read_secret(secret_name(team_id))
     if not sec or not sec.get("bot_token"):
         return {"ok": False, "message": "bot_token missing"}
-    # Collect all public channels the bot is already a member of
     all_channels, cursor = [], None
     while True:
         params = {"limit": 200, "types": "public_channel", "exclude_archived": "true"}
@@ -1228,7 +1317,6 @@ def backfill_all_private(team_id: str, request: Request):
     sec = read_secret(secret_name(team_id))
     if not sec or not sec.get("bot_token"):
         return {"ok": False, "message": "bot_token missing"}
-    # Collect all private channels the bot is already a member of
     all_channels, cursor = [], None
     while True:
         params = {"limit": 200, "types": "private_channel", "exclude_archived": "true"}
@@ -1273,7 +1361,6 @@ async def slack_events(request: Request):
     require_ddb()
     raw_body = await request.body()
 
-    # Reject oversized payloads before any processing
     if len(raw_body) > MAX_BODY_BYTES:
         logger.warning("Slack event payload too large", extra={"size_bytes": len(raw_body)})
         return JSONResponse({"ok": False, "error": "payload_too_large"}, status_code=413)
@@ -1368,9 +1455,21 @@ def api_search(
 ):
     if response is not None:
         no_cache(response)
-    require_team_access(request, team_id)
+    sess = require_team_access(request, team_id)
+    _check_rate_limit(sess["session_id"], "search", RATE_LIMIT_SEARCH)
+
+    # Sanitize and validate all query params
+    team_id    = _validate_team_id(team_id)
+    channel_id = _validate_channel_id(channel_id)
+    q          = _validate_search_query(q)
+    username   = _validate_username_param(username)
+    if from_date:
+        _validate_date(from_date)
+    if to_date:
+        _validate_date(to_date)
     if from_date and to_date and from_date > to_date:
         raise HTTPException(400, "'from' must be before 'to'")
+
     sec = read_secret(secret_name(team_id))
     bot_token = (sec or {}).get("bot_token") if sec and not sec.get("_error") else None
     request_id = str(uuid.uuid4())[:8]
@@ -1402,12 +1501,24 @@ def api_search_multi(
 ):
     if response is not None:
         no_cache(response)
-    require_team_access(request, team_id)
+    sess = require_team_access(request, team_id)
+    _check_rate_limit(sess["session_id"], "search", RATE_LIMIT_SEARCH)
+
+    # Sanitize and validate all query params
+    team_id  = _validate_team_id(team_id)
+    q        = _validate_search_query(q)
+    username = _validate_username_param(username)
+    if from_date:
+        _validate_date(from_date)
+    if to_date:
+        _validate_date(to_date)
     if from_date and to_date and from_date > to_date:
         raise HTTPException(400, "'from' must be before 'to'")
-    ids = [c.strip() for c in channel_ids.split(",") if c.strip()]
+
+    ids = [_validate_channel_id(c.strip()) for c in channel_ids.split(",") if c.strip()]
     if not ids:
         raise HTTPException(400, "channel_ids must be non-empty")
+
     sec = read_secret(secret_name(team_id))
     bot_token = (sec or {}).get("bot_token") if sec and not sec.get("_error") else None
     request_id = str(uuid.uuid4())[:8]
@@ -1449,13 +1560,13 @@ def _validate_channel_id(v: str) -> str:
 
 
 class ChatRequest(BaseModel):
-    team_id: str = Field(..., min_length=1, max_length=20)
-    channel_id: str = Field(..., min_length=1, max_length=20)
-    question: str = Field(..., min_length=1, max_length=MAX_QUESTION_LEN)
-    from_date: Optional[str] = Field(None)
-    to_date: Optional[str] = Field(None)
-    user_id: Optional[str] = Field(None, max_length=20)
-    top_k: int = Field(10, ge=1, le=12)
+    team_id:    str           = Field(..., min_length=1, max_length=20)
+    channel_id: str           = Field(..., min_length=1, max_length=20)
+    question:   str           = Field(..., min_length=1, max_length=MAX_QUESTION_LEN)
+    from_date:  Optional[str] = Field(None)
+    to_date:    Optional[str] = Field(None)
+    user_id:    Optional[str] = Field(None, max_length=20)
+    top_k:      int           = Field(10, ge=1, le=12)
 
     @field_validator("team_id")
     @classmethod
@@ -1472,20 +1583,20 @@ class ChatRequest(BaseModel):
     @field_validator("question")
     @classmethod
     def validate_question(cls, v: str) -> str:
-        v = v.strip()
+        v = _sanitize_text(v, "Question", MAX_QUESTION_LEN)
         if not v:
             raise ValueError("question cannot be blank")
         return v
 
 
 class MultiChatRequest(BaseModel):
-    team_id: str = Field(..., min_length=1, max_length=20)
-    channel_ids: list[str] = Field(..., min_length=1, max_length=MAX_CHANNEL_IDS)
-    question: str = Field(..., min_length=1, max_length=MAX_QUESTION_LEN)
-    from_date: Optional[str] = Field(None)
-    to_date: Optional[str] = Field(None)
-    user_id: Optional[str] = Field(None, max_length=20)
-    top_k: int = Field(10, ge=1, le=20)
+    team_id:     str           = Field(..., min_length=1, max_length=20)
+    channel_ids: list[str]     = Field(..., min_length=1, max_length=MAX_CHANNEL_IDS)
+    question:    str           = Field(..., min_length=1, max_length=MAX_QUESTION_LEN)
+    from_date:   Optional[str] = Field(None)
+    to_date:     Optional[str] = Field(None)
+    user_id:     Optional[str] = Field(None, max_length=20)
+    top_k:       int           = Field(10, ge=1, le=20)
 
     @field_validator("team_id")
     @classmethod
@@ -1507,7 +1618,7 @@ class MultiChatRequest(BaseModel):
     @field_validator("question")
     @classmethod
     def validate_question(cls, v: str) -> str:
-        v = v.strip()
+        v = _sanitize_text(v, "Question", MAX_QUESTION_LEN)
         if not v:
             raise ValueError("question cannot be blank")
         return v
@@ -1517,7 +1628,10 @@ class MultiChatRequest(BaseModel):
 def api_chat(body: ChatRequest, request: Request, response: Response):
     no_cache(response)
     request_id = str(uuid.uuid4())[:8]
-    require_team_access(request, body.team_id)
+    sess = require_team_access(request, body.team_id)
+    _check_rate_limit(sess["session_id"], "chat", RATE_LIMIT_CHAT)
+    _check_prompt_injection(body.question)
+
     if not body.question.strip():
         raise HTTPException(400, "question cannot be empty")
 
@@ -1567,8 +1681,8 @@ def api_chat(body: ChatRequest, request: Request, response: Response):
         "Citations: <[1], [2] etc>"
     )
     augmented_q  = _augment_question_with_senders(body.question, messages)
-    user_prompt = f"SLACK MESSAGES:\n{context}\n\nQUESTION: {augmented_q}"
-    answer_text   = _groq_complete(user_prompt, MAX_TOKENS_SINGLE, system=system_prompt)
+    user_prompt  = f"SLACK MESSAGES:\n{context}\n\nQUESTION: {augmented_q}"
+    answer_text  = _groq_complete(user_prompt, MAX_TOKENS_SINGLE, system=system_prompt)
     cited_indices = [int(n)-1 for n in re.findall(r"\[(\d+)\]", answer_text) if n.isdigit() and 0 < int(n) <= len(messages)]
     citations     = [messages[i] for i in dict.fromkeys(cited_indices)]
 
@@ -1587,7 +1701,10 @@ def api_chat(body: ChatRequest, request: Request, response: Response):
 def api_chat_multi(body: MultiChatRequest, request: Request, response: Response):
     no_cache(response)
     request_id = str(uuid.uuid4())[:8]
-    require_team_access(request, body.team_id)
+    sess = require_team_access(request, body.team_id)
+    _check_rate_limit(sess["session_id"], "chat", RATE_LIMIT_CHAT)
+    _check_prompt_injection(body.question)
+
     if not body.question.strip():
         raise HTTPException(400, "question cannot be empty")
     if not body.channel_ids:
@@ -1635,8 +1752,8 @@ def api_chat_multi(body: MultiChatRequest, request: Request, response: Response)
         "Citations: <[1], [2] etc>"
     )
     augmented_q  = _augment_question_with_senders(body.question, messages)
-    user_prompt = f"SLACK MESSAGES:\n{context}\n\nQUESTION: {augmented_q}"
-    answer_text   = _groq_complete(user_prompt, MAX_TOKENS_MULTI, system=system_prompt)
+    user_prompt  = f"SLACK MESSAGES:\n{context}\n\nQUESTION: {augmented_q}"
+    answer_text  = _groq_complete(user_prompt, MAX_TOKENS_MULTI, system=system_prompt)
     cited_indices = [int(n)-1 for n in re.findall(r"\[(\d+)\]", answer_text) if n.isdigit() and 0 < int(n) <= len(messages)]
     citations     = [messages[i] for i in dict.fromkeys(cited_indices)]
 
