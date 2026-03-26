@@ -1762,10 +1762,12 @@ def _handle_bot_message(
             "⚠️ You're sending messages too fast — please wait a moment.", thread_ts)
         return
 
-    # ── Normalize Slack-encoded channel links ─────────────────────────────────
-    # Slack converts #channel-name → <#C0XXXXXX|channel-name> in message text.
-    # We must convert back to plain #channel-name before regex matching.
-    normalized_text = _normalize_slack_channel_links(user_text.strip(), bot_token)
+    # ── Normalize Slack text ────────────────────────────────────────────────────
+    # 1. Decode HTML entities: Slack encodes literal < > & as &lt; &gt; &amp;
+    # 2. Convert Slack channel links <#C0XXXXXX|channel-name> → #channel-name
+    cleaned_text = user_text.strip()
+    cleaned_text = cleaned_text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    normalized_text = _normalize_slack_channel_links(cleaned_text, bot_token)
     logger.info("Bot command parsing", extra={
         "original": user_text.strip()[:200],
         "normalized": normalized_text[:200],
@@ -1779,7 +1781,9 @@ def _handle_bot_message(
             "• `search #channel-name <keywords>` — keyword search\n"
             "• `summarize #channel-name` — summarize recent messages\n"
             "• `summarize #channel-name last 50` — summarize last N messages\n"
-            "• `ask all <question>` — search across ALL channels\n\n"
+            "• `ask all <question>` — search across ALL channels\n"
+            "• `search all <keywords>` — keyword search across ALL channels\n"
+            "• `summarize all` — summarize across ALL channels\n\n"
             "_Example:_ `ask #general what did John say about the deadline?`"
         ), thread_ts)
         return
@@ -1891,6 +1895,59 @@ def _handle_bot_message(
 
     # FIX 3: Pass team_id + bot_token so <@U12345> mentions resolve to display names
     active_username = extract_username_from_question(query, team_id=team_id, bot_token=bot_token)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SEARCH command — return raw keyword results directly (no AI)
+    # ══════════════════════════════════════════════════════════════════════════
+    if cmd == "search":
+        try:
+            if search_all or len(channel_ids) > 1:
+                messages = retrieve_messages_multi(
+                    team_id, channel_ids, query, None, None, None, 200, 20,
+                    username=active_username, bot_token=bot_token,
+                )
+            else:
+                messages = retrieve_messages(
+                    team_id, channel_ids[0], query, None, None, None, 200, 20,
+                    username=active_username, bot_token=bot_token,
+                )
+        except Exception as e:
+            logger.error("Bot search retrieval failed", extra={"error": str(e)})
+            _post_slack_message(bot_token, dm_channel,
+                "⚠️ I had trouble searching messages. Please try again.", thread_ts)
+            return
+
+        ch_label = "all channels" if search_all else f"#{ch_name}"
+        if not messages:
+            note = (f"No messages matching *{query}* found"
+                    f"{f' from *{active_username}*' if active_username else ''}"
+                    f" in {ch_label}.")
+            _post_slack_message(bot_token, dm_channel, note, thread_ts)
+            return
+
+        # Format results as a clean list — no AI involved
+        lines = [f"🔍 Found *{len(messages)}* result{'s' if len(messages) != 1 else ''} for *{query}* in {ch_label}:\n"]
+        for i, msg in enumerate(messages[:20], 1):
+            who  = msg.get("username") or msg.get("user_id") or "unknown"
+            when = msg.get("timestamp_human", "")
+            text = (msg.get("text") or "").strip()
+            # Truncate long messages
+            snippet = text[:300] + ("…" if len(text) > 300 else "")
+            ch_tag = ""
+            if search_all and msg.get("channel_id"):
+                ch_tag = f" | #{msg['channel_id']}"
+            lines.append(f"*[{i}]* {when} — *{who}*{ch_tag}:\n> {snippet}\n")
+
+        _post_slack_message(bot_token, dm_channel, "\n".join(lines), thread_ts)
+        logger.info("Bot search results sent", extra={
+            "team_id": team_id, "channel_ids": channel_ids,
+            "user_id": user_id, "result_count": len(messages), "query": query,
+        })
+        return
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ASK command — AI-powered question answering
+    # ══════════════════════════════════════════════════════════════════════════
 
     # ── FIX 4: Positional + user-filter queries ───────────────────────────────
     # "last message from @user" — is BOTH positional AND user-filtered.
