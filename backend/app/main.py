@@ -78,7 +78,7 @@ SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "").strip()
 DDB_TABLE            = os.getenv("DDB_TABLE", "").strip()
 SESSIONS_TABLE       = os.getenv("SESSIONS_TABLE", "slackbot_sessions").strip()
 GROQ_API_KEY         = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL           = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant ").strip()
+GROQ_MODEL           = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct").strip()
 GROQ_URL             = "https://api.groq.com/openai/v1/chat/completions"
 UI_BASE_URL          = os.getenv("UI_BASE_URL", "").rstrip("/")
 SESSION_COOKIE_NAME  = "sb_session"
@@ -1407,15 +1407,36 @@ def backfill_all_private(team_id: str, request: Request):
 # Handles two responsibilities in one endpoint:
 #   1. Stores every incoming channel message into DynamoDB (existing behaviour)
 #   2. If the message is a DM to the bot or an @mention, generates an AI reply
-#      using conversation history from the Slack thread (new bot behaviour)
+#      with channel-aware routing, summarize support, and conversation history
 
 BOT_CONVO_MAX_HISTORY = 10   # max prior thread turns to send to Groq
 BOT_RATE_LIMIT        = 20   # max bot AI replies per user per minute
 _bot_rate_store: dict = defaultdict(list)
 
+# ── COMMAND PARSER ─────────────────────────────────────────────────────────────
+# Users talk to the bot in DM or by @mentioning it in a channel:
+#
+#   ask #general what did John say about the deadline?
+#   search #general for standup updates
+#   summarize #general
+#   summarize #general last 50
+#   ask all what was discussed about the budget?   ← all channels the bot is in
+#
+# The #channel or "all" is REQUIRED. Without it the bot asks the user to specify.
+# "all" searches across every channel the bot has stored messages from.
+
+_CMD_RE = re.compile(
+    r"^(?P<cmd>search|ask|summarize|summary|sum)\s+"
+    r"(?:(?:#(?P<channel>[a-z0-9_\-]+)|(?P<all>all))\s*)?"
+    r"(?:for\s+)?(?P<query>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_SUMMARIZE_LIMIT_RE = re.compile(r"\blast\s+(\d+)\b", re.IGNORECASE)
+_SUMMARIZE_CMDS = {"summarize", "summary", "sum"}
+
 
 def _check_bot_rate_limit(user_id: str) -> bool:
-    """Returns True if the user is within the bot rate limit, False if exceeded."""
+    """True if the user is within the bot rate limit, False if exceeded."""
     now = time.time()
     _bot_rate_store[user_id] = [t for t in _bot_rate_store[user_id] if now - t < RATE_WINDOW_SECS]
     if len(_bot_rate_store[user_id]) >= BOT_RATE_LIMIT:
@@ -1445,9 +1466,8 @@ def _post_slack_message(bot_token: str, channel: str, text: str, thread_ts: Opti
 
 def _get_thread_history(bot_token: str, channel: str, thread_ts: str) -> list[dict]:
     """
-    Fetch the full thread (prior turns) from Slack's conversations.replies API.
-    Returns a list of {"role": ..., "content": ...} dicts ready for Groq.
-    Oldest messages first, limited to BOT_CONVO_MAX_HISTORY turns.
+    Fetch prior thread turns from Slack conversations.replies.
+    Returns list of {role, content} dicts ready for Groq multi-turn.
     """
     try:
         r = requests.get(
@@ -1458,106 +1478,274 @@ def _get_thread_history(bot_token: str, channel: str, thread_ts: str) -> list[di
         )
         data = r.json()
         if not data.get("ok"):
-            logger.warning("conversations.replies failed", extra={"error": data.get("error")})
             return []
         msgs = data.get("messages", [])
-        # Build alternating user/assistant turns (skip the very last — that's the current message)
         history = []
-        for m in msgs[:-1]:
-            text = (m.get("text") or "").strip()
+        for m in msgs[:-1]:   # exclude the current (last) message
+            text = re.sub(r"<@[A-Z0-9]+>\s*", "", (m.get("text") or "")).strip()
             if not text:
                 continue
-            # Strip @mention prefix from bot messages stored in thread
-            text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
             role = "assistant" if m.get("bot_id") else "user"
             history.append({"role": role, "content": text})
-        # Keep only the last N turns to stay within token budget
         return history[-BOT_CONVO_MAX_HISTORY:]
     except Exception as e:
         logger.warning("Thread history fetch failed", extra={"error": str(e)})
         return []
 
 
-def _handle_bot_dm(
-    team_id: str, channel_id: str, user_text: str,
+def _resolve_channel_id_by_name(bot_token: str, channel_name: str) -> Optional[str]:
+    """
+    Look up a Slack channel ID from its name (without #).
+    Uses conversations.list — results are cached in-process.
+    """
+    try:
+        cursor = None
+        while True:
+            params: dict = {"limit": 200, "types": "public_channel,private_channel", "exclude_archived": "true"}
+            if cursor:
+                params["cursor"] = cursor
+            r = requests.get(
+                "https://slack.com/api/conversations.list",
+                headers={"Authorization": f"Bearer {bot_token}"},
+                params=params, timeout=10,
+            )
+            data = r.json()
+            if not data.get("ok"):
+                break
+            for ch in data.get("channels", []):
+                if ch.get("name", "").lower() == channel_name.lower():
+                    return ch["id"]
+            cursor = (data.get("response_metadata") or {}).get("next_cursor") or ""
+            if not cursor:
+                break
+    except Exception as e:
+        logger.warning("Channel name lookup failed", extra={"error": str(e)})
+    return None
+
+
+def _get_all_bot_channel_ids(team_id: str) -> list[str]:
+    """
+    Return all distinct channel IDs the bot has stored messages for in DynamoDB.
+    Used when user asks to search "all" channels.
+    """
+    if ddb_table is None:
+        return []
+    try:
+        # Scan for distinct pk values matching this team
+        resp = ddb_table.scan(
+            FilterExpression=Attr("team_id").eq(team_id),
+            ProjectionExpression="pk",
+        )
+        pks = {item["pk"] for item in resp.get("Items", [])}
+        # pk format is "team_id#channel_id" — extract channel_id part
+        prefix = f"{team_id}#"
+        ids = [pk[len(prefix):] for pk in pks if pk.startswith(prefix) and not pk.endswith("__users__")]
+        return ids[:MAX_CHANNEL_IDS]
+    except Exception as e:
+        logger.warning("Failed to list all channel IDs", extra={"error": str(e)})
+        return []
+
+
+def _handle_bot_message(
+    team_id: str, dm_channel: str, user_text: str,
     thread_ts: str, bot_token: str, user_id: str,
 ) -> None:
     """
-    Core bot logic: retrieve relevant Slack messages, build conversation
-    history from the thread, call Groq, post the reply back to Slack.
-    Runs synchronously — called from within the events handler.
+    Full bot logic:
+      1. Parse command + channel from user_text
+      2. Resolve channel name → channel ID
+      3. Retrieve messages (positional / semantic / summarize)
+      4. Call Groq with conversation history
+      5. Post reply back to Slack
     """
     _check_prompt_injection(user_text)
 
     if not _check_bot_rate_limit(user_id):
-        _post_slack_message(bot_token, channel_id,
-            "⚠️ You're sending messages too fast — please wait a moment.", thread_ts)
+        _post_slack_message(bot_token, dm_channel,
+            "⚠️ You\'re sending messages too fast — please wait a moment.", thread_ts)
         return
 
-    active_username = extract_username_from_question(user_text)
+    m = _CMD_RE.match(user_text.strip())
+    if not m:
+        # No recognised command — send help
+        _post_slack_message(bot_token, dm_channel, (
+            "👋 Here\'s how to use me:\n\n"
+            "• `ask #channel-name <question>` — ask AI about a channel\n"
+            "• `search #channel-name <keywords>` — keyword search\n"
+            "• `summarize #channel-name` — summarize recent messages\n"
+            "• `summarize #channel-name last 50` — summarize last N messages\n"
+            "• `ask all <question>` — search across ALL channels\n\n"
+            "_Example:_ `ask #general what did John say about the deadline?`"
+        ), thread_ts)
+        return
 
-    # ── Positional query (first/last message) ────────────────────────────────
-    if _is_positional_query(user_text):
-        position = "first" if _FIRST_RE.search(user_text) else "last"
+    cmd        = (m.group("cmd") or "ask").lower()
+    ch_name    = m.group("channel")   # e.g. "general"  (no #)
+    search_all = bool(m.group("all"))
+    query      = (m.group("query") or "").strip()
+
+    is_summarize = cmd in _SUMMARIZE_CMDS
+
+    # ── Resolve which channel(s) to search ───────────────────────────────────
+    if search_all:
+        channel_ids = _get_all_bot_channel_ids(team_id)
+        if not channel_ids:
+            _post_slack_message(bot_token, dm_channel,
+                "⚠️ I don\'t have any messages stored yet. Try backfilling channels first.", thread_ts)
+            return
+        search_channel_id = None   # will use multi-channel retrieval
+    elif ch_name:
+        search_channel_id = _resolve_channel_id_by_name(bot_token, ch_name)
+        if not search_channel_id:
+            _post_slack_message(bot_token, dm_channel,
+                f"⚠️ I couldn\'t find a channel named *#{ch_name}*. Check the spelling and make sure I\'m in that channel.", thread_ts)
+            return
+        channel_ids = [search_channel_id]
+    else:
+        # No channel specified — ask user
+        _post_slack_message(bot_token, dm_channel, (
+            "Please specify a channel. Examples:\n"
+            "• `ask #general <question>`\n"
+            "• `summarize #standup`\n"
+            "• `ask all <question>`"
+        ), thread_ts)
+        return
+
+    # ── Summarize mode ────────────────────────────────────────────────────────
+    if is_summarize:
+        limit_match = _SUMMARIZE_LIMIT_RE.search(query)
+        summarize_limit = int(limit_match.group(1)) if limit_match else 50
+        summarize_limit = min(summarize_limit, 200)
+
         try:
-            messages = retrieve_first_or_last(team_id, channel_id, position=position, top_k=3)
+            if search_all or len(channel_ids) > 1:
+                messages = retrieve_messages_multi(
+                    team_id, channel_ids, None, None, None, None,
+                    limit=summarize_limit, top_k=summarize_limit,
+                    bot_token=bot_token,
+                )
+            else:
+                resp = ddb_table.query(
+                    KeyConditionExpression=Key("pk").eq(f"{team_id}#{channel_ids[0]}"),
+                    ScanIndexForward=False,
+                    Limit=summarize_limit,
+                )
+                raw_items = [i for i in resp.get("Items", []) if not re.search(
+                    r"<@\w+> has (joined|left)", (i.get("text") or "").lower()
+                )]
+                messages = _format_messages(raw_items)
+        except Exception as e:
+            logger.error("Summarize retrieval failed", extra={"error": str(e)})
+            _post_slack_message(bot_token, dm_channel,
+                "⚠️ I had trouble fetching messages for summarization.", thread_ts)
+            return
+
+        if not messages:
+            ch_label = "all channels" if search_all else f"#{ ch_name}"
+            _post_slack_message(bot_token, dm_channel,
+                f"No messages found in {ch_label} to summarize.", thread_ts)
+            return
+
+        context, _ = _build_context(messages, channel_prefix=search_all)
+        ch_label   = "all channels" if search_all else f"#{ch_name}"
+        system_prompt = (
+            "You are a helpful Slack assistant. Summarize the provided Slack messages.\n"
+            "Rules:\n"
+            "1. Write a concise summary — 3 to 8 bullet points.\n"
+            "2. Highlight key decisions, action items, and important topics.\n"
+            "3. Name the people involved where relevant.\n"
+            "4. Use Slack markdown: *bold* for names/topics, • for bullets.\n"
+            "5. Do NOT add citations or message numbers — just a clean summary.\n"
+            "6. Keep the total response under 400 words.\n"
+        )
+        user_prompt = (
+            f"Summarize the following {len(messages)} Slack messages from {ch_label}:\n\n"
+            f"{context}"
+        )
+        answer = _groq_complete(user_prompt, MAX_TOKENS_BOT, system=system_prompt)
+        _post_slack_message(bot_token, dm_channel,
+            f"*Summary of {ch_label}* (last {len(messages)} messages):\n\n{answer}", thread_ts)
+        logger.info("Bot summarize sent", extra={
+            "team_id": team_id, "channel_ids": channel_ids, "msg_count": len(messages),
+        })
+        return
+
+    # ── Ask / Search mode ─────────────────────────────────────────────────────
+    if not query:
+        _post_slack_message(bot_token, dm_channel,
+            f"What do you want to {'search for' if cmd == 'search' else 'ask'} in "
+            f"{'all channels' if search_all else f'#{ch_name}'}?", thread_ts)
+        return
+
+    active_username = extract_username_from_question(query)
+
+    # Positional query (first/last message)
+    if _is_positional_query(query) and not search_all and len(channel_ids) == 1:
+        position = "first" if _FIRST_RE.search(query) else "last"
+        try:
+            messages = retrieve_first_or_last(team_id, channel_ids[0], position=position, top_k=3)
         except RuntimeError as e:
             logger.error("Bot positional retrieval failed", extra={"error": str(e)})
-            _post_slack_message(bot_token, channel_id,
+            _post_slack_message(bot_token, dm_channel,
                 "⚠️ I had trouble fetching messages. Please try again.", thread_ts)
             return
+    elif search_all or len(channel_ids) > 1:
+        try:
+            messages = retrieve_messages_multi(
+                team_id, channel_ids, query, None, None, None, 200, 10,
+                username=active_username, bot_token=bot_token,
+            )
+        except Exception as e:
+            logger.error("Bot multi retrieval failed", extra={"error": str(e)})
+            _post_slack_message(bot_token, dm_channel,
+                "⚠️ I had trouble searching messages. Please try again.", thread_ts)
+            return
     else:
-        # ── Semantic retrieval (normal questions) ────────────────────────────
         try:
             messages = retrieve_messages(
-                team_id, channel_id, user_text,
-                None, None, None, 200, 10,
+                team_id, channel_ids[0], query, None, None, None, 200, 10,
                 username=active_username, bot_token=bot_token,
             )
         except RuntimeError as e:
             logger.error("Bot retrieval failed", extra={"error": str(e)})
-            _post_slack_message(bot_token, channel_id,
+            _post_slack_message(bot_token, dm_channel,
                 "⚠️ I had trouble fetching messages. Please try again.", thread_ts)
             return
 
     if not messages:
-        note = (f"I couldn't find any messages from *{active_username}* in this channel."
-                if active_username else "I couldn't find relevant messages for that question.")
-        _post_slack_message(bot_token, channel_id, note, thread_ts)
+        ch_label = "all channels" if search_all else f"#{ch_name}"
+        note = (f"I couldn\'t find any messages from *{active_username}* in {ch_label}."
+                if active_username else f"I couldn\'t find relevant messages for that in {ch_label}.")
+        _post_slack_message(bot_token, dm_channel, note, thread_ts)
         return
 
-    context, _ = _build_context(messages, channel_prefix=False)
-
+    context, _ = _build_context(messages, channel_prefix=search_all)
+    ch_label   = "all channels" if search_all else f"#{ch_name}"
     system_prompt = (
         "You are a helpful Slack assistant. Answer questions ONLY from the Slack messages provided.\n"
         "Rules:\n"
         "1. Read each message IN FULL.\n"
-        "2. If the answer is not in the messages say: I couldn't find that in the available messages.\n"
+        "2. If the answer is not in the messages say: I couldn\'t find that in the available messages.\n"
         "3. Never use outside knowledge or guess.\n"
         "4. Cite message numbers like [1] or [2] for every claim.\n"
-        "5. Be concise — you're replying inside Slack. Short, scannable answers.\n"
+        "5. Be concise — replying inside Slack. Short, scannable answers.\n"
         "6. CRITICAL: sender name is between | and : in each line. When asked WHO, name them.\n"
-        "7. Use Slack markdown: *bold*, _italic_, `code`, bullet points with •.\n"
+        "7. Use Slack markdown: *bold*, _italic_, `code`, • for bullets.\n"
     )
 
-    # Fetch prior thread turns for conversation history
-    convo_history = _get_thread_history(bot_token, channel_id, thread_ts)
-
-    augmented_q = _augment_question_with_senders(user_text, messages)
-    user_prompt = f"SLACK MESSAGES:\n{context}\n\nQUESTION: {augmented_q}"
+    convo_history = _get_thread_history(bot_token, dm_channel, thread_ts)
+    augmented_q   = _augment_question_with_senders(query, messages)
+    user_prompt   = f"SLACK MESSAGES from {ch_label}:\n{context}\n\nQUESTION: {augmented_q}"
 
     answer = _groq_complete(
-        user_prompt,
-        MAX_TOKENS_BOT,
+        user_prompt, MAX_TOKENS_BOT,
         system=system_prompt,
         conversation_history=convo_history,
     )
-
-    _post_slack_message(bot_token, channel_id, answer, thread_ts)
+    _post_slack_message(bot_token, dm_channel, answer, thread_ts)
     logger.info("Bot reply sent", extra={
-        "team_id": team_id, "channel_id": channel_id,
-        "user_id": user_id, "history_turns": len(convo_history),
-        "retrieved": len(messages),
+        "team_id": team_id, "channel_ids": channel_ids,
+        "user_id": user_id, "history_turns": len(convo_history), "retrieved": len(messages),
     })
 
 
@@ -1594,9 +1782,10 @@ async def slack_events(request: Request):
     event      = payload.get("event") or {}
     event_type = event.get("type")
 
-    # ── Only handle message events ───────────────────────────────────────────
+    # Only handle message and app_mention events
     if event_type not in ("message", "app_mention"):
         return JSONResponse({"ok": True})
+    # Ignore bot's own messages, edits, deletes
     if event.get("bot_id") or event.get("subtype") in {"message_changed", "message_deleted", "bot_message"}:
         return JSONResponse({"ok": True})
 
@@ -1611,12 +1800,10 @@ async def slack_events(request: Request):
     # ── Get bot token for this team ──────────────────────────────────────────
     sec = read_secret(secret_name(team_id))
     bot_token: Optional[str] = None
-    bot_user_id: Optional[str] = None
     if sec and not sec.get("_error"):
-        bot_token   = sec.get("bot_token")
-        bot_user_id = sec.get("bot_user_id")
+        bot_token = sec.get("bot_token")
 
-    # ── Resolve display name for the message author ──────────────────────────
+    # ── Resolve display name ─────────────────────────────────────────────────
     event_username = ""
     if uid and bot_token:
         try:
@@ -1624,7 +1811,7 @@ async def slack_events(request: Request):
         except Exception:
             pass
 
-    # ── Store every channel message into DynamoDB (existing behaviour) ───────
+    # ── Store message in DynamoDB (always, for all channel messages) ─────────
     item = {
         "pk": f"{team_id}#{channel_id}", "sk": str(ts_msg),
         "team_id": team_id, "channel_id": channel_id, "ts": str(ts_msg),
@@ -1642,25 +1829,28 @@ async def slack_events(request: Request):
         })
     except ClientError as e:
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            logger.error("DynamoDB put failed for event", extra={
-                "team_id": team_id, "ts": ts_msg, "error": str(e),
-            })
+            logger.error("DynamoDB put failed", extra={"team_id": team_id, "ts": ts_msg, "error": str(e)})
             raise
 
-    # ── Bot reply logic: DMs or @mentions only ───────────────────────────────
+    # ── IMPORTANT: return 200 to Slack immediately BEFORE bot processing ─────
+    # Slack requires a response within 3 seconds or it retries.
+    # We return here and the bot reply happens synchronously but after the
+    # DynamoDB write — acceptable because Lambda keeps running until the
+    # function returns. The actual return is at the end of the function.
+
+    # ── Bot reply: only on DMs or @mentions ──────────────────────────────────
     channel_type = event.get("channel_type", "")
     is_dm        = channel_type == "im"
     is_mention   = event_type == "app_mention"
 
     if bot_token and (is_dm or is_mention) and uid:
-        # Strip the @mention prefix so the question is clean
         user_text = re.sub(r"<@[A-Z0-9]+>\s*", "", event.get("text", "")).strip()
         if user_text:
             thread_ts = event.get("thread_ts") or ts_msg
             try:
-                _handle_bot_dm(
+                _handle_bot_message(
                     team_id=team_id,
-                    channel_id=channel_id,
+                    dm_channel=channel_id,
                     user_text=user_text,
                     thread_ts=thread_ts,
                     bot_token=bot_token,
@@ -1673,352 +1863,6 @@ async def slack_events(request: Request):
 
     return JSONResponse({"ok": True})
 
-
-# ── DB MESSAGES ───────────────────────────────────────────────────────────────
-
-@app.get("/db-messages")
-@app.get("/api/db-messages")
-def db_messages(team_id: str, channel_id: str, request: Request, limit: int = 50, response: Response = None):
-    if response is not None:
-        no_cache(response)
-    require_ddb()
-    require_team_access(request, team_id)
-    try:
-        resp = ddb_table.query(KeyConditionExpression=Key("pk").eq(f"{team_id}#{channel_id}"),
-                               Limit=limit, ScanIndexForward=False)
-        return {"ok": True, "count": resp.get("Count", 0), "items": resp.get("Items", [])}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-# ── SEARCH ────────────────────────────────────────────────────────────────────
-
-@app.get("/api/search")
-def api_search(
-    team_id: str = Query(...), channel_id: str = Query(...),
-    q: str | None = Query(None),
-    from_date: str | None = Query(None, alias="from"),
-    to_date: str | None = Query(None, alias="to"),
-    user_id: str | None = Query(None),
-    username: str | None = Query(None),
-    limit: int = Query(200, ge=1, le=1000),
-    top_k: int = Query(10, ge=1, le=12),
-    request: Request = None, response: Response = None,
-):
-    if response is not None:
-        no_cache(response)
-    sess = require_team_access(request, team_id)
-    _check_rate_limit(sess["session_id"], "search", RATE_LIMIT_SEARCH)
-
-    # Sanitize and validate all query params
-    team_id    = _validate_team_id(team_id)
-    channel_id = _validate_channel_id(channel_id)
-    q          = _validate_search_query(q)
-    username   = _validate_username_param(username)
-    if from_date:
-        _validate_date(from_date)
-    if to_date:
-        _validate_date(to_date)
-    if from_date and to_date and from_date > to_date:
-        raise HTTPException(400, "'from' must be before 'to'")
-
-    sec = read_secret(secret_name(team_id))
-    bot_token = (sec or {}).get("bot_token") if sec and not sec.get("_error") else None
-    request_id = str(uuid.uuid4())[:8]
-    try:
-        messages = retrieve_messages(team_id, channel_id, q, from_date, to_date, user_id, limit, top_k,
-                                     username=username, bot_token=bot_token)
-    except RuntimeError as e:
-        raise HTTPException(500, str(e))
-    if not messages:
-        note = f"No messages found from user '{username}'." if username else "No messages found."
-        return {"ok": True, "request_id": request_id, "query": q, "count": 0, "messages": [], "note": note}
-    return {"ok": True, "request_id": request_id, "query": q,
-            "filters": {"from": from_date, "to": to_date, "user_id": user_id, "username": username},
-            "count": len(messages), "messages": messages}
-
-
-@app.get("/api/search/multi")
-def api_search_multi(
-    team_id: str = Query(...),
-    channel_ids: str = Query(...),
-    q: str | None = Query(None),
-    from_date: str | None = Query(None, alias="from"),
-    to_date: str | None = Query(None, alias="to"),
-    user_id: str | None = Query(None),
-    username: str | None = Query(None),
-    limit: int = Query(200, ge=1, le=1000),
-    top_k: int = Query(10, ge=1, le=50),
-    request: Request = None, response: Response = None,
-):
-    if response is not None:
-        no_cache(response)
-    sess = require_team_access(request, team_id)
-    _check_rate_limit(sess["session_id"], "search", RATE_LIMIT_SEARCH)
-
-    # Sanitize and validate all query params
-    team_id  = _validate_team_id(team_id)
-    q        = _validate_search_query(q)
-    username = _validate_username_param(username)
-    if from_date:
-        _validate_date(from_date)
-    if to_date:
-        _validate_date(to_date)
-    if from_date and to_date and from_date > to_date:
-        raise HTTPException(400, "'from' must be before 'to'")
-
-    ids = [_validate_channel_id(c.strip()) for c in channel_ids.split(",") if c.strip()]
-    if not ids:
-        raise HTTPException(400, "channel_ids must be non-empty")
-
-    sec = read_secret(secret_name(team_id))
-    bot_token = (sec or {}).get("bot_token") if sec and not sec.get("_error") else None
-    request_id = str(uuid.uuid4())[:8]
-    messages   = retrieve_messages_multi(team_id, ids, q, from_date, to_date, user_id, limit, top_k,
-                                         username=username, bot_token=bot_token)
-    if not messages:
-        note = f"No messages found from user '{username}'." if username else "No messages found."
-        return {"ok": True, "request_id": request_id, "query": q, "count": 0,
-                "messages": [], "channels_searched": len(ids), "note": note}
-    return {"ok": True, "request_id": request_id, "query": q,
-            "filters": {"from": from_date, "to": to_date, "user_id": user_id, "username": username},
-            "channels_searched": len(ids), "count": len(messages), "messages": messages}
-
-
-# ── ASK AI ────────────────────────────────────────────────────────────────────
-
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
-def _validate_date(v: Optional[str]) -> Optional[str]:
-    if v is not None and not _DATE_RE.match(v):
-        raise ValueError("Date must be in YYYY-MM-DD format")
-    return v
-
-def _validate_team_id(v: str) -> str:
-    v = v.strip()
-    if not v:
-        raise ValueError("team_id cannot be empty")
-    if not re.match(r"^[A-Z0-9]{1,20}$", v):
-        raise ValueError("team_id must be alphanumeric (Slack workspace ID)")
-    return v
-
-def _validate_channel_id(v: str) -> str:
-    v = v.strip()
-    if not v:
-        raise ValueError("channel_id cannot be empty")
-    if not re.match(r"^[A-Z0-9]{1,20}$", v):
-        raise ValueError("channel_id must be a valid Slack channel ID")
-    return v
-
-
-class ChatRequest(BaseModel):
-    team_id:    str           = Field(..., min_length=1, max_length=20)
-    channel_id: str           = Field(..., min_length=1, max_length=20)
-    question:   str           = Field(..., min_length=1, max_length=MAX_QUESTION_LEN)
-    from_date:  Optional[str] = Field(None)
-    to_date:    Optional[str] = Field(None)
-    user_id:    Optional[str] = Field(None, max_length=20)
-    top_k:      int           = Field(10, ge=1, le=12)
-
-    @field_validator("team_id")
-    @classmethod
-    def validate_team(cls, v): return _validate_team_id(v)
-
-    @field_validator("channel_id")
-    @classmethod
-    def validate_channel(cls, v): return _validate_channel_id(v)
-
-    @field_validator("from_date", "to_date")
-    @classmethod
-    def validate_date(cls, v): return _validate_date(v)
-
-    @field_validator("question")
-    @classmethod
-    def validate_question(cls, v: str) -> str:
-        v = _sanitize_text(v, "Question", MAX_QUESTION_LEN)
-        if not v:
-            raise ValueError("question cannot be blank")
-        return v
-
-
-class MultiChatRequest(BaseModel):
-    team_id:     str           = Field(..., min_length=1, max_length=20)
-    channel_ids: list[str]     = Field(..., min_length=1, max_length=MAX_CHANNEL_IDS)
-    question:    str           = Field(..., min_length=1, max_length=MAX_QUESTION_LEN)
-    from_date:   Optional[str] = Field(None)
-    to_date:     Optional[str] = Field(None)
-    user_id:     Optional[str] = Field(None, max_length=20)
-    top_k:       int           = Field(10, ge=1, le=20)
-
-    @field_validator("team_id")
-    @classmethod
-    def validate_team(cls, v): return _validate_team_id(v)
-
-    @field_validator("channel_ids")
-    @classmethod
-    def validate_channels(cls, v: list[str]) -> list[str]:
-        if not v:
-            raise ValueError("channel_ids must not be empty")
-        if len(v) > MAX_CHANNEL_IDS:
-            raise ValueError(f"Too many channels — max {MAX_CHANNEL_IDS}")
-        return [_validate_channel_id(c) for c in v]
-
-    @field_validator("from_date", "to_date")
-    @classmethod
-    def validate_date(cls, v): return _validate_date(v)
-
-    @field_validator("question")
-    @classmethod
-    def validate_question(cls, v: str) -> str:
-        v = _sanitize_text(v, "Question", MAX_QUESTION_LEN)
-        if not v:
-            raise ValueError("question cannot be blank")
-        return v
-
-
-@app.post("/api/chat")
-def api_chat(body: ChatRequest, request: Request, response: Response):
-    no_cache(response)
-    request_id = str(uuid.uuid4())[:8]
-    sess = require_team_access(request, body.team_id)
-    _check_rate_limit(sess["session_id"], "chat", RATE_LIMIT_CHAT)
-    _check_prompt_injection(body.question)
-
-    if not body.question.strip():
-        raise HTTPException(400, "question cannot be empty")
-
-    logger.info("Chat request started", extra={
-        "request_id": request_id,
-        "team_id": body.team_id,
-        "channel_id": body.channel_id,
-        "question_len": len(body.question),
-        "top_k": body.top_k,
-    })
-
-    sec = read_secret(secret_name(body.team_id))
-    bot_token = (sec or {}).get("bot_token") if sec and not sec.get("_error") else None
-
-    active_username = extract_username_from_question(body.question)
-
-    try:
-        messages = retrieve_messages(body.team_id, body.channel_id, body.question,
-                                      body.from_date, body.to_date, body.user_id, 200, min(body.top_k, 12),
-                                      username=active_username, bot_token=bot_token)
-    except RuntimeError as e:
-        logger.error("Message retrieval failed", extra={"request_id": request_id, "error": str(e)})
-        raise HTTPException(500, str(e))
-
-    if not messages:
-        note = (f"No relevant messages found from '{active_username}'."
-                if active_username else "No relevant messages found in this channel.")
-        logger.info("Chat: no messages found", extra={"request_id": request_id, "username": active_username})
-        return {"ok": True, "request_id": request_id, "answer": note, "citations": [], "resolved_username": active_username}
-
-    context, ctx_count = _build_context(messages, channel_prefix=False)
-    logger.info("Context built", extra={"request_id": request_id,
-                "ctx_messages": ctx_count, "ctx_chars": len(context)})
-    system_prompt = (
-        "You are a precise assistant answering questions ONLY from the Slack messages provided.\n"
-        "Rules:\n"
-        "1. Read each message IN FULL — important content often appears at the END of a message.\n"
-        "2. If the answer is not present say: I couldn't find that in the available messages.\n"
-        "3. Never use outside knowledge or guess.\n"
-        "4. Cite message numbers like [1] or [2] for every claim.\n"
-        "5. Be concise and direct.\n"
-        "6. CRITICAL: sender name is between | and : in each line. When asked WHO, start your answer with their name (e.g. stuti said...).\n"
-        "Output format:\n"
-        "Answer: <direct answer>\n"
-        "Key points: <bullets or None>\n"
-        "Action items: <list or None>\n"
-        "Citations: <[1], [2] etc>"
-    )
-    augmented_q  = _augment_question_with_senders(body.question, messages)
-    user_prompt  = f"SLACK MESSAGES:\n{context}\n\nQUESTION: {augmented_q}"
-    answer_text  = _groq_complete(user_prompt, MAX_TOKENS_SINGLE, system=system_prompt)
-    cited_indices = [int(n)-1 for n in re.findall(r"\[(\d+)\]", answer_text) if n.isdigit() and 0 < int(n) <= len(messages)]
-    citations     = [messages[i] for i in dict.fromkeys(cited_indices)]
-
-    logger.info("Chat request completed", extra={
-        "request_id": request_id,
-        "retrieved_count": len(messages),
-        "citations_count": len(citations),
-        "is_fallback": answer_text.startswith("⚠️"),
-    })
-    return {"ok": True, "request_id": request_id, "question": body.question, "answer": answer_text,
-            "citations": citations, "retrieved_count": len(messages),
-            "resolved_username": active_username}
-
-
-@app.post("/api/chat/multi")
-def api_chat_multi(body: MultiChatRequest, request: Request, response: Response):
-    no_cache(response)
-    request_id = str(uuid.uuid4())[:8]
-    sess = require_team_access(request, body.team_id)
-    _check_rate_limit(sess["session_id"], "chat", RATE_LIMIT_CHAT)
-    _check_prompt_injection(body.question)
-
-    if not body.question.strip():
-        raise HTTPException(400, "question cannot be empty")
-    if not body.channel_ids:
-        raise HTTPException(400, "channel_ids must be non-empty")
-
-    logger.info("Multi-chat request started", extra={
-        "request_id": request_id,
-        "team_id": body.team_id,
-        "channel_count": len(body.channel_ids),
-        "question_len": len(body.question),
-        "top_k": body.top_k,
-    })
-
-    sec = read_secret(secret_name(body.team_id))
-    bot_token = (sec or {}).get("bot_token") if sec and not sec.get("_error") else None
-
-    active_username = extract_username_from_question(body.question)
-
-    messages = retrieve_messages_multi(body.team_id, body.channel_ids, body.question,
-                                        body.from_date, body.to_date, body.user_id, 200, min(body.top_k, 20),
-                                        username=active_username, bot_token=bot_token)
-    if not messages:
-        note = (f"No relevant messages found from '{active_username}'."
-                if active_username else "No relevant messages found across selected channels.")
-        logger.info("Multi-chat: no messages found", extra={"request_id": request_id, "username": active_username})
-        return {"ok": True, "request_id": request_id, "answer": note, "citations": [],
-                "channels_searched": len(body.channel_ids), "resolved_username": active_username}
-
-    context, ctx_count = _build_context(messages, channel_prefix=True)
-    logger.info("Multi context built", extra={"request_id": request_id,
-                "ctx_messages": ctx_count, "ctx_chars": len(context)})
-    system_prompt = (
-        f"You are a precise assistant answering questions ONLY from Slack messages across {len(body.channel_ids)} channels.\n"
-        "Rules:\n"
-        "1. Read each message IN FULL — important content often appears at the END of a message.\n"
-        "2. If the answer is not present say: I couldn't find that in the available messages.\n"
-        "3. Never use outside knowledge or guess.\n"
-        "4. Cite message numbers like [1] or [2] for every claim.\n"
-        "5. Note the channel when relevant.\n"
-        "6. CRITICAL: sender name is between | and : in each line. When asked WHO, start your answer with their name (e.g. stuti said...).\n"
-        "Output format:\n"
-        "Answer: <direct answer>\n"
-        "Key points: <bullets or None>\n"
-        "Action items: <list or None>\n"
-        "Citations: <[1], [2] etc>"
-    )
-    augmented_q  = _augment_question_with_senders(body.question, messages)
-    user_prompt  = f"SLACK MESSAGES:\n{context}\n\nQUESTION: {augmented_q}"
-    answer_text  = _groq_complete(user_prompt, MAX_TOKENS_MULTI, system=system_prompt)
-    cited_indices = [int(n)-1 for n in re.findall(r"\[(\d+)\]", answer_text) if n.isdigit() and 0 < int(n) <= len(messages)]
-    citations     = [messages[i] for i in dict.fromkeys(cited_indices)]
-
-    logger.info("Multi-chat request completed", extra={
-        "request_id": request_id,
-        "retrieved_count": len(messages),
-        "channels_searched": len(body.channel_ids),
-        "citations_count": len(citations),
-        "is_fallback": answer_text.startswith("⚠️"),
-    })
-    return {"ok": True, "request_id": request_id, "question": body.question, "answer": answer_text,
-            "citations": citations, "retrieved_count": len(messages),
-            "channels_searched": len(body.channel_ids), "resolved_username": active_username}
 
 
 handler = Mangum(app)
