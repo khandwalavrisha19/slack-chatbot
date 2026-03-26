@@ -892,11 +892,58 @@ GROQ_TIMEOUT_READ    = 30  # seconds to read response
 CONTEXT_MAX_CHARS = 8_000  # hard cap on total context string sent to LLM
 MAX_TOKENS_SINGLE = 768    # max output tokens for /api/chat
 MAX_TOKENS_MULTI  = 900    # max output tokens for /api/chat/multi
+MAX_TOKENS_BOT    = 600    # max output tokens for Slack bot replies
 
-def _groq_complete(prompt: str, max_tokens: int = 1024, system: Optional[str] = None) -> str:
+# ── POSITIONAL QUERY DETECTION ───────────────────────────────────────────────
+_POSITIONAL_RE = re.compile(
+    r"\b(first|last|latest|earliest|recent|newest|oldest)\b.{0,30}(message|msg|post|said|sent|thing|text)",
+    re.IGNORECASE,
+)
+_FIRST_RE = re.compile(r"\b(first|earliest|oldest)\b", re.IGNORECASE)
+
+
+def _is_positional_query(q: str) -> bool:
+    """True if user is asking for the first or last message by position/time."""
+    return bool(_POSITIONAL_RE.search(q))
+
+
+def retrieve_first_or_last(
+    team_id: str, channel_id: str, position: str = "last", top_k: int = 3,
+) -> list[dict]:
+    """
+    Fetch the chronologically first or last messages directly from DynamoDB,
+    bypassing semantic scoring entirely.
+    position='last'  → ScanIndexForward=False (newest first)
+    position='first' → ScanIndexForward=True  (oldest first)
+    """
+    require_ddb()
+    forward = position == "first"
+    try:
+        resp = ddb_table.query(
+            KeyConditionExpression=Key("pk").eq(f"{team_id}#{channel_id}"),
+            ScanIndexForward=forward,
+            Limit=top_k * 3,  # over-fetch to allow join/left filtering
+        )
+        items = resp.get("Items", [])
+    except Exception as e:
+        raise RuntimeError(f"DynamoDB positional query failed: {e}")
+
+    items = [i for i in items if not re.search(
+        r"<@\w+> has (joined|left)", (i.get("text") or "").lower()
+    )]
+    return _format_messages(items[:top_k])
+
+
+def _groq_complete(
+    prompt: str,
+    max_tokens: int = 1024,
+    system: Optional[str] = None,
+    conversation_history: Optional[list[dict]] = None,
+) -> str:
     """
     Call Groq API with explicit connect + read timeouts.
-    Accepts an optional system prompt for grounding rules.
+    Accepts an optional system prompt and optional multi-turn conversation history.
+    conversation_history: list of {"role": "user"|"assistant", "content": "..."}
     Returns a safe fallback message instead of raising on timeout/5xx.
     """
     request_id = str(uuid.uuid4())[:8]
@@ -907,6 +954,9 @@ def _groq_complete(prompt: str, max_tokens: int = 1024, system: Optional[str] = 
     messages_payload: list[dict] = []
     if system:
         messages_payload.append({"role": "system", "content": system})
+    # Inject conversation history (prior turns) before the current prompt
+    if conversation_history:
+        messages_payload.extend(conversation_history)
     messages_payload.append({"role": "user", "content": prompt})
 
     payload = {
@@ -1353,7 +1403,163 @@ def backfill_all_private(team_id: str, request: Request):
     return {"ok": True, "total_stored": total_stored, "results": results}
 
 
-# ── SLACK EVENTS WEBHOOK (no session — uses Slack signing secret) ─────────────
+# ── SLACK EVENTS WEBHOOK ──────────────────────────────────────────────────────
+# Handles two responsibilities in one endpoint:
+#   1. Stores every incoming channel message into DynamoDB (existing behaviour)
+#   2. If the message is a DM to the bot or an @mention, generates an AI reply
+#      using conversation history from the Slack thread (new bot behaviour)
+
+BOT_CONVO_MAX_HISTORY = 10   # max prior thread turns to send to Groq
+BOT_RATE_LIMIT        = 20   # max bot AI replies per user per minute
+_bot_rate_store: dict = defaultdict(list)
+
+
+def _check_bot_rate_limit(user_id: str) -> bool:
+    """Returns True if the user is within the bot rate limit, False if exceeded."""
+    now = time.time()
+    _bot_rate_store[user_id] = [t for t in _bot_rate_store[user_id] if now - t < RATE_WINDOW_SECS]
+    if len(_bot_rate_store[user_id]) >= BOT_RATE_LIMIT:
+        return False
+    _bot_rate_store[user_id].append(now)
+    return True
+
+
+def _post_slack_message(bot_token: str, channel: str, text: str, thread_ts: Optional[str] = None) -> None:
+    """Post a message back to a Slack channel, optionally in a thread."""
+    payload: dict = {"channel": channel, "text": text}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    try:
+        r = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {bot_token}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=10,
+        )
+        data = r.json()
+        if not data.get("ok"):
+            logger.warning("chat.postMessage failed", extra={"error": data.get("error"), "channel": channel})
+    except Exception as e:
+        logger.error("Slack post failed", extra={"error": str(e)})
+
+
+def _get_thread_history(bot_token: str, channel: str, thread_ts: str) -> list[dict]:
+    """
+    Fetch the full thread (prior turns) from Slack's conversations.replies API.
+    Returns a list of {"role": ..., "content": ...} dicts ready for Groq.
+    Oldest messages first, limited to BOT_CONVO_MAX_HISTORY turns.
+    """
+    try:
+        r = requests.get(
+            "https://slack.com/api/conversations.replies",
+            headers={"Authorization": f"Bearer {bot_token}"},
+            params={"channel": channel, "ts": thread_ts, "limit": BOT_CONVO_MAX_HISTORY * 2},
+            timeout=10,
+        )
+        data = r.json()
+        if not data.get("ok"):
+            logger.warning("conversations.replies failed", extra={"error": data.get("error")})
+            return []
+        msgs = data.get("messages", [])
+        # Build alternating user/assistant turns (skip the very last — that's the current message)
+        history = []
+        for m in msgs[:-1]:
+            text = (m.get("text") or "").strip()
+            if not text:
+                continue
+            # Strip @mention prefix from bot messages stored in thread
+            text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
+            role = "assistant" if m.get("bot_id") else "user"
+            history.append({"role": role, "content": text})
+        # Keep only the last N turns to stay within token budget
+        return history[-BOT_CONVO_MAX_HISTORY:]
+    except Exception as e:
+        logger.warning("Thread history fetch failed", extra={"error": str(e)})
+        return []
+
+
+def _handle_bot_dm(
+    team_id: str, channel_id: str, user_text: str,
+    thread_ts: str, bot_token: str, user_id: str,
+) -> None:
+    """
+    Core bot logic: retrieve relevant Slack messages, build conversation
+    history from the thread, call Groq, post the reply back to Slack.
+    Runs synchronously — called from within the events handler.
+    """
+    _check_prompt_injection(user_text)
+
+    if not _check_bot_rate_limit(user_id):
+        _post_slack_message(bot_token, channel_id,
+            "⚠️ You're sending messages too fast — please wait a moment.", thread_ts)
+        return
+
+    active_username = extract_username_from_question(user_text)
+
+    # ── Positional query (first/last message) ────────────────────────────────
+    if _is_positional_query(user_text):
+        position = "first" if _FIRST_RE.search(user_text) else "last"
+        try:
+            messages = retrieve_first_or_last(team_id, channel_id, position=position, top_k=3)
+        except RuntimeError as e:
+            logger.error("Bot positional retrieval failed", extra={"error": str(e)})
+            _post_slack_message(bot_token, channel_id,
+                "⚠️ I had trouble fetching messages. Please try again.", thread_ts)
+            return
+    else:
+        # ── Semantic retrieval (normal questions) ────────────────────────────
+        try:
+            messages = retrieve_messages(
+                team_id, channel_id, user_text,
+                None, None, None, 200, 10,
+                username=active_username, bot_token=bot_token,
+            )
+        except RuntimeError as e:
+            logger.error("Bot retrieval failed", extra={"error": str(e)})
+            _post_slack_message(bot_token, channel_id,
+                "⚠️ I had trouble fetching messages. Please try again.", thread_ts)
+            return
+
+    if not messages:
+        note = (f"I couldn't find any messages from *{active_username}* in this channel."
+                if active_username else "I couldn't find relevant messages for that question.")
+        _post_slack_message(bot_token, channel_id, note, thread_ts)
+        return
+
+    context, _ = _build_context(messages, channel_prefix=False)
+
+    system_prompt = (
+        "You are a helpful Slack assistant. Answer questions ONLY from the Slack messages provided.\n"
+        "Rules:\n"
+        "1. Read each message IN FULL.\n"
+        "2. If the answer is not in the messages say: I couldn't find that in the available messages.\n"
+        "3. Never use outside knowledge or guess.\n"
+        "4. Cite message numbers like [1] or [2] for every claim.\n"
+        "5. Be concise — you're replying inside Slack. Short, scannable answers.\n"
+        "6. CRITICAL: sender name is between | and : in each line. When asked WHO, name them.\n"
+        "7. Use Slack markdown: *bold*, _italic_, `code`, bullet points with •.\n"
+    )
+
+    # Fetch prior thread turns for conversation history
+    convo_history = _get_thread_history(bot_token, channel_id, thread_ts)
+
+    augmented_q = _augment_question_with_senders(user_text, messages)
+    user_prompt = f"SLACK MESSAGES:\n{context}\n\nQUESTION: {augmented_q}"
+
+    answer = _groq_complete(
+        user_prompt,
+        MAX_TOKENS_BOT,
+        system=system_prompt,
+        conversation_history=convo_history,
+    )
+
+    _post_slack_message(bot_token, channel_id, answer, thread_ts)
+    logger.info("Bot reply sent", extra={
+        "team_id": team_id, "channel_id": channel_id,
+        "user_id": user_id, "history_turns": len(convo_history),
+        "retrieved": len(messages),
+    })
+
 
 @app.post("/slack/events")
 @app.post("/api/slack/events")
@@ -1371,9 +1577,11 @@ async def slack_events(request: Request):
         logger.warning("Slack event: invalid JSON body")
         return JSONResponse({"ok": False, "error": "invalid_json"}, status_code=400)
 
+    # ── URL verification (one-time Slack setup handshake) ────────────────────
     if payload.get("type") == "url_verification":
         return JSONResponse({"challenge": payload.get("challenge")})
 
+    # ── Signature verification ───────────────────────────────────────────────
     timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
     signature = request.headers.get("X-Slack-Signature", "")
     if not verify_slack_signature(SLACK_SIGNING_SECRET, timestamp, raw_body, signature):
@@ -1383,10 +1591,13 @@ async def slack_events(request: Request):
     if payload.get("type") != "event_callback":
         return JSONResponse({"ok": True})
 
-    event = payload.get("event") or {}
-    if event.get("type") != "message":
+    event      = payload.get("event") or {}
+    event_type = event.get("type")
+
+    # ── Only handle message events ───────────────────────────────────────────
+    if event_type not in ("message", "app_mention"):
         return JSONResponse({"ok": True})
-    if event.get("bot_id") or event.get("subtype") in {"message_changed", "message_deleted"}:
+    if event.get("bot_id") or event.get("subtype") in {"message_changed", "message_deleted", "bot_message"}:
         return JSONResponse({"ok": True})
 
     team_id    = payload.get("team_id")
@@ -1396,15 +1607,24 @@ async def slack_events(request: Request):
         return JSONResponse({"ok": True})
 
     uid = event.get("user")
+
+    # ── Get bot token for this team ──────────────────────────────────────────
+    sec = read_secret(secret_name(team_id))
+    bot_token: Optional[str] = None
+    bot_user_id: Optional[str] = None
+    if sec and not sec.get("_error"):
+        bot_token   = sec.get("bot_token")
+        bot_user_id = sec.get("bot_user_id")
+
+    # ── Resolve display name for the message author ──────────────────────────
     event_username = ""
-    if uid:
+    if uid and bot_token:
         try:
-            sec = read_secret(secret_name(team_id))
-            if sec and not sec.get("_error") and sec.get("bot_token"):
-                event_username = resolve_username_for_message(team_id, uid, sec["bot_token"])
+            event_username = resolve_username_for_message(team_id, uid, bot_token)
         except Exception:
             pass
 
+    # ── Store every channel message into DynamoDB (existing behaviour) ───────
     item = {
         "pk": f"{team_id}#{channel_id}", "sk": str(ts_msg),
         "team_id": team_id, "channel_id": channel_id, "ts": str(ts_msg),
@@ -1413,12 +1633,44 @@ async def slack_events(request: Request):
         "type": event.get("type"), "fetched_at": datetime.utcnow().isoformat() + "Z",
     }
     try:
-        ddb_table.put_item(Item=item, ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)")
-        logger.info("Slack event stored", extra={"team_id": team_id, "channel_id": channel_id, "ts": ts_msg, "user_id": uid})
+        ddb_table.put_item(
+            Item=item,
+            ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)",
+        )
+        logger.info("Slack event stored", extra={
+            "team_id": team_id, "channel_id": channel_id, "ts": ts_msg, "user_id": uid,
+        })
     except ClientError as e:
         if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            logger.error("DynamoDB put failed for event", extra={"team_id": team_id, "ts": ts_msg, "error": str(e)})
+            logger.error("DynamoDB put failed for event", extra={
+                "team_id": team_id, "ts": ts_msg, "error": str(e),
+            })
             raise
+
+    # ── Bot reply logic: DMs or @mentions only ───────────────────────────────
+    channel_type = event.get("channel_type", "")
+    is_dm        = channel_type == "im"
+    is_mention   = event_type == "app_mention"
+
+    if bot_token and (is_dm or is_mention) and uid:
+        # Strip the @mention prefix so the question is clean
+        user_text = re.sub(r"<@[A-Z0-9]+>\s*", "", event.get("text", "")).strip()
+        if user_text:
+            thread_ts = event.get("thread_ts") or ts_msg
+            try:
+                _handle_bot_dm(
+                    team_id=team_id,
+                    channel_id=channel_id,
+                    user_text=user_text,
+                    thread_ts=thread_ts,
+                    bot_token=bot_token,
+                    user_id=uid,
+                )
+            except Exception as e:
+                logger.error("Bot handler error", extra={"error": str(e), "team_id": team_id})
+                _post_slack_message(bot_token, channel_id,
+                    "⚠️ Something went wrong. Please try again.", thread_ts)
+
     return JSONResponse({"ok": True})
 
 

@@ -144,7 +144,7 @@ Resources:
       FunctionName: !Sub "${Env}-slackbot-api"
       PackageType: Image
       Role: !GetAtt LambdaExecutionRole.Arn
-      Timeout: 30
+      Timeout: 60
       MemorySize: 1024
       Code:
         ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/slackbot-api:${ImageTag}"
@@ -158,7 +158,7 @@ Resources:
           SLACK_SIGNING_SECRET: !Ref SlackSigningSecret
           SLACK_REDIRECT_URI: !Sub "https://${FrontendDomain}/api/oauth/callback"
           GROQ_API_KEY: !Ref GroqApiKey
-          SLACK_SCOPES: "channels:read,groups:read,channels:history,groups:history,users:read,chat:write,channels:join"
+          SLACK_SCOPES: "channels:read,groups:read,channels:history,groups:history,im:history,mpim:history,users:read,chat:write,channels:join,app_mentions:read"
           SESSIONS_TABLE: !Ref SessionsTable
           ENV: !Ref Env
 
@@ -236,10 +236,26 @@ Resources:
                 - Authorization
                 - Content-Type
                 - Origin
+                - X-Slack-Request-Timestamp
+                - X-Slack-Signature
               Cookies:
                 Forward: all
 
-         
+          # /slack/* routes (bot events webhook — must forward Slack headers)
+          - PathPattern: "/slack/*"
+            TargetOriginId: apigw-origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+            ForwardedValues:
+              QueryString: false
+              Headers:
+                - Content-Type
+                - X-Slack-Request-Timestamp
+                - X-Slack-Signature
+              Cookies:
+                Forward: none
   # BUCKET POLICY
   # -------------------------
   FrontendBucketPolicy:
