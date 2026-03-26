@@ -1846,7 +1846,7 @@ async def slack_events(request: Request):
     if bot_token and (is_dm or is_mention) and uid:
         user_text = re.sub(r"<@[A-Z0-9]+>\s*", "", event.get("text", "")).strip()
         if user_text:
-            thread_ts = event.get("thread_ts") or ts_msg
+            thread_ts = event.get("thread_ts")  # only reply in thread if message is already in one
             try:
                 _handle_bot_message(
                     team_id=team_id,
