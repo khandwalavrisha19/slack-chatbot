@@ -1594,13 +1594,54 @@ BOT_CONVO_MAX_HISTORY = 10
 BOT_RATE_LIMIT        = 20
 _bot_rate_store: dict = defaultdict(list)
 
-# ── FIX 2: _CMD_RE — make channel/all REQUIRED (remove outer ?) ──────────────
-# Old regex had (?:...)?  making the channel group optional, causing regex
-# backtracking to dump "#new-channel" into the query group instead → ch_name=None.
+# ── Slack-encoded channel link normalizer ────────────────────────────────────
+# Slack encodes "#general" as "<#C0XXXXXX|general>" or sometimes "<#C0XXXXXX>".
+# We must convert these back to plain "#channel-name" before command parsing.
+_SLACK_CHANNEL_LINK_RE = re.compile(r"<#([A-Z0-9]+)(?:\|([a-z0-9_\-]+))?>", re.IGNORECASE)
+
+
+def _normalize_slack_channel_links(text: str, bot_token: str = "") -> str:
+    """
+    Replace Slack-encoded channel links with plain #channel-name.
+
+    Handles two formats:
+      <#C0XXXXXX|channel-name>  → #channel-name
+      <#C0XXXXXX>              → look up name via API, or use #C0XXXXXX as fallback
+    """
+    def _replace(match):
+        ch_id   = match.group(1)
+        ch_name = match.group(2)  # may be None if no pipe
+        if ch_name:
+            return f"#{ch_name}"
+        # No pipe name — try to resolve via Slack API
+        if bot_token:
+            try:
+                r = requests.get(
+                    "https://slack.com/api/conversations.info",
+                    headers={"Authorization": f"Bearer {bot_token}"},
+                    params={"channel": ch_id},
+                    timeout=5,
+                )
+                data = r.json()
+                if data.get("ok"):
+                    resolved_name = data.get("channel", {}).get("name", "")
+                    if resolved_name:
+                        return f"#{resolved_name}"
+            except Exception:
+                pass
+        # Fallback: use channel ID directly so _CMD_RE still captures it
+        return f"#{ch_id}"
+
+    return _SLACK_CHANNEL_LINK_RE.sub(_replace, text)
+
+
+# ── FIX 2: _CMD_RE — channel/all REQUIRED ────────────────────────────────────
+# Matches: ask #channel-name <query>, ask all <query>, search #channel <query>
+# Channel can be a name (a-z0-9_-) or a raw Slack channel ID (C + alphanums)
 _CMD_RE = re.compile(
     r"^(?P<cmd>search|ask|summarize|summary|sum)\s+"
-    r"(?:#(?P<channel>[a-z0-9_\-]+)|(?P<all>all))"   # ← REQUIRED, no trailing ?
-    r"(?:\s+(?:for\s+)?(?P<query>.*))?$",              # ← query is optional
+    r"(?:#(?P<channel>[a-zA-Z0-9_\-]+)|(?P<all>all))"
+    r"(?:\s+(?:for\s+)?(?P<query>.*))?$",
     re.IGNORECASE | re.DOTALL,
 )
 _SUMMARIZE_LIMIT_RE = re.compile(r"\blast\s+(\d+)\b", re.IGNORECASE)
@@ -1721,7 +1762,16 @@ def _handle_bot_message(
             "⚠️ You're sending messages too fast — please wait a moment.", thread_ts)
         return
 
-    m = _CMD_RE.match(user_text.strip())
+    # ── Normalize Slack-encoded channel links ─────────────────────────────────
+    # Slack converts #channel-name → <#C0XXXXXX|channel-name> in message text.
+    # We must convert back to plain #channel-name before regex matching.
+    normalized_text = _normalize_slack_channel_links(user_text.strip(), bot_token)
+    logger.info("Bot command parsing", extra={
+        "original": user_text.strip()[:200],
+        "normalized": normalized_text[:200],
+    })
+
+    m = _CMD_RE.match(normalized_text)
     if not m:
         _post_slack_message(bot_token, dm_channel, (
             "👋 Here's how to use me:\n\n"
@@ -1738,6 +1788,9 @@ def _handle_bot_message(
     ch_name    = m.group("channel")
     search_all = bool(m.group("all"))
     query      = (m.group("query") or "").strip()
+    # Strip angle bracket wrappers if user typed <question> with literal < >
+    if query.startswith("<") and query.endswith(">"):
+        query = query[1:-1].strip()
 
     is_summarize = cmd in _SUMMARIZE_CMDS
 
@@ -1750,7 +1803,12 @@ def _handle_bot_message(
             return
         search_channel_id = None
     elif ch_name:
-        search_channel_id = _resolve_channel_id_by_name(bot_token, ch_name)
+        # ch_name could be a plain name like "general" or a raw Slack channel ID like "C0XXXXXX"
+        if re.match(r"^[A-Z0-9]{8,15}$", ch_name):
+            # It's already a channel ID (from a <#CXXXXXX> link without pipe name)
+            search_channel_id = ch_name
+        else:
+            search_channel_id = _resolve_channel_id_by_name(bot_token, ch_name)
         if not search_channel_id:
             _post_slack_message(bot_token, dm_channel,
                 f"⚠️ I couldn't find a channel named *#{ch_name}*. Check the spelling and make sure I'm in that channel.", thread_ts)
