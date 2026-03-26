@@ -1736,7 +1736,10 @@ def _get_all_bot_channel_ids(team_id: str) -> list[str]:
         )
         pks = {item["pk"] for item in resp.get("Items", [])}
         prefix = f"{team_id}#"
-        ids = [pk[len(prefix):] for pk in pks if pk.startswith(prefix) and not pk.endswith("__users__")]
+        ids = [pk[len(prefix):] for pk in pks
+               if pk.startswith(prefix)
+               and not pk.endswith("__users__")
+               and not pk[len(prefix):].startswith("D")]  # exclude DM channels
         return ids[:MAX_CHANNEL_IDS]
     except Exception as e:
         logger.warning("Failed to list all channel IDs", extra={"error": str(e)})
@@ -2108,28 +2111,31 @@ async def slack_events(request: Request):
         except Exception:
             pass
 
-    item = {
-        "pk": f"{team_id}#{channel_id}", "sk": str(ts_msg),
-        "team_id": team_id, "channel_id": channel_id, "ts": str(ts_msg),
-        "user_id": uid, "username": event_username, "text": event.get("text", ""),
-        "thread_ts": event.get("thread_ts"), "subtype": event.get("subtype"),
-        "type": event.get("type"), "fetched_at": datetime.utcnow().isoformat() + "Z",
-    }
-    try:
-        ddb_table.put_item(
-            Item=item,
-            ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)",
-        )
-        logger.info("Slack event stored", extra={
-            "team_id": team_id, "channel_id": channel_id, "ts": ts_msg, "user_id": uid,
-        })
-    except ClientError as e:
-        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-            logger.error("DynamoDB put failed", extra={"team_id": team_id, "ts": ts_msg, "error": str(e)})
-            raise
-
+    # Only store messages from real channels (not DMs with the bot)
     channel_type = event.get("channel_type", "")
     is_dm        = channel_type == "im"
+
+    if not is_dm:
+        item = {
+            "pk": f"{team_id}#{channel_id}", "sk": str(ts_msg),
+            "team_id": team_id, "channel_id": channel_id, "ts": str(ts_msg),
+            "user_id": uid, "username": event_username, "text": event.get("text", ""),
+            "thread_ts": event.get("thread_ts"), "subtype": event.get("subtype"),
+            "type": event.get("type"), "fetched_at": datetime.utcnow().isoformat() + "Z",
+        }
+        try:
+            ddb_table.put_item(
+                Item=item,
+                ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)",
+            )
+            logger.info("Slack event stored", extra={
+                "team_id": team_id, "channel_id": channel_id, "ts": ts_msg, "user_id": uid,
+            })
+        except ClientError as e:
+            if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                logger.error("DynamoDB put failed", extra={"team_id": team_id, "ts": ts_msg, "error": str(e)})
+                raise
+
     is_mention   = event_type == "app_mention"
 
     if bot_token and (is_dm or is_mention) and uid:
