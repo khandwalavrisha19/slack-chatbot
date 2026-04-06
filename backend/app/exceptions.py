@@ -2,8 +2,8 @@ from fastapi import Request, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from constants import MAX_BODY_BYTES
-from logger import logger
+from app.constants import MAX_BODY_BYTES
+from app.logger import logger
 
 
 # ── REQUEST SIZE LIMIT MIDDLEWARE ─────────────────────────────────────────────

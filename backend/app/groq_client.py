@@ -5,8 +5,8 @@ from typing import Optional
 import requests
 from fastapi import HTTPException
 
-from constants import GROQ_API_KEY, GROQ_MODEL, GROQ_URL, GROQ_TIMEOUT_CONNECT, GROQ_TIMEOUT_READ
-from logger import logger
+from app.constants import GROQ_API_KEY, GROQ_MODEL, GROQ_URL, GROQ_TIMEOUT_CONNECT, GROQ_TIMEOUT_READ
+from app.logger import logger
 
 
 def _groq_complete(prompt: str, max_tokens: int = 1024, system: Optional[str] = None) -> str:

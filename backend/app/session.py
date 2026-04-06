@@ -5,9 +5,9 @@ from typing import Optional
 
 from fastapi import HTTPException, Request, Response
 
-from constants import SESSION_COOKIE_NAME, SESSION_TTL_HOURS, IS_PROD
-from logger import logger
-from utils import sessions_table
+from app.constants import SESSION_COOKIE_NAME, SESSION_TTL_HOURS, IS_PROD
+from app.logger import logger
+from app.utils import sessions_table
 
 
 # ── INTERNAL GUARD ────────────────────────────────────────────────────────────

@@ -3,9 +3,9 @@ from typing import Optional
 
 from boto3.dynamodb.conditions import Key, Attr
 
-from constants import CONTEXT_MAX_CHARS
-from logger import logger
-from utils import ddb_table, _date_to_sk, _ts_human, require_ddb, resolve_user_id
+from app.constants import CONTEXT_MAX_CHARS
+from app.logger import logger
+from app.utils import ddb_table, _date_to_sk, _ts_human, require_ddb, resolve_user_id
 
 
 # ── RECENCY / KEYWORD HELPERS ─────────────────────────────────────────────────

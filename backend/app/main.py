@@ -20,9 +20,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from mangum import Mangum
 
-from constants import PARSED_CORS_ORIGINS
-from exceptions import register_exception_handlers
-from routes import router
+from app.constants import PARSED_CORS_ORIGINS
+from app.exceptions import register_exception_handlers
+from app.routes import router
 
 # ── APP FACTORY ───────────────────────────────────────────────────────────────
 app = FastAPI(title="Slackbot Full MVP")
