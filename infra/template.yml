@@ -10,9 +10,6 @@ Parameters:
     Type: String
     Description: "ECR image tag e.g. dev-a571a8b"
 
-  ApiDomain:
-    Type: String
-    Description: "API Gateway domain like abc.execute-api.ap-south-1.amazonaws.com"
 
   FrontendDomain:
     Type: String
@@ -162,6 +159,21 @@ Resources:
           SESSIONS_TABLE: !Ref SessionsTable
           ENV: !Ref Env
 
+  SlackbotFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !Ref SlackbotFunction
+      AuthType: NONE
+      InvokeMode: BUFFERED
+
+  SlackbotFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SlackbotFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
   # -------------------------
   # S3 BUCKET
   # -------------------------
@@ -204,7 +216,7 @@ Resources:
             OriginAccessControlId: !Ref FrontendOAC
 
           - Id: apigw-origin
-            DomainName: !Ref ApiDomain
+            DomainName: !Select [2, !Split ["/", !GetAtt SlackbotFunctionUrl.FunctionUrl]]
             OriginPath: ""
             CustomOriginConfig:
               OriginProtocolPolicy: https-only

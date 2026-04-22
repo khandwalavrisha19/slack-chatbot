@@ -10,8 +10,6 @@ permissions:
   id-token: write
   contents: read
 
-env:
-  AWS_REGION: ap-south-1
   ECR_REPOSITORY: slackbot-api
   TEMPLATE_FILE: infra/template.yml
 
@@ -34,7 +32,8 @@ jobs:
             SLACK_CLIENT_SECRET="${{ secrets.DEV_SLACK_CLIENT_SECRET }}"
             SLACK_SIGNING_SECRET="${{ secrets.DEV_SLACK_SIGNING_SECRET }}"
             GROQ_API_KEY="${{ secrets.DEV_GROQ_API_KEY }}"
-            API_DOMAIN="${{ secrets.DEV_API_DOMAIN }}"
+            API_DOMAIN=""
+            AWS_REGION="us-west-2"
           elif [ "${GITHUB_REF_NAME}" = "main" ]; then
             ENV_NAME="prod"
             STACK_NAME="prod-slackbot-stack"
@@ -44,6 +43,7 @@ jobs:
             SLACK_SIGNING_SECRET="${{ secrets.PROD_SLACK_SIGNING_SECRET }}"
             GROQ_API_KEY="${{ secrets.PROD_GROQ_API_KEY }}"
             API_DOMAIN="${{ secrets.PROD_API_DOMAIN }}"
+            AWS_REGION="ap-south-1"
           else
             echo "Unsupported branch: ${GITHUB_REF_NAME}"
             exit 1
@@ -61,6 +61,7 @@ jobs:
           echo "GROQ_API_KEY=$GROQ_API_KEY" >> "$GITHUB_ENV"
           echo "API_DOMAIN=$API_DOMAIN" >> "$GITHUB_ENV"
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+          echo "AWS_REGION=$AWS_REGION" >> "$GITHUB_ENV"
 
           echo "Using ENV_NAME=$ENV_NAME"
           echo "Using STACK_NAME=$STACK_NAME"
@@ -120,21 +121,19 @@ jobs:
       - name: Deploy CloudFormation stack
         shell: bash
         run: |
+          # Conditionally build parameters string to support Prod's ApiDomain requirement
+          PARAMS="Env=$ENV_NAME ImageTag=$IMAGE_TAG FrontendDomain=$FRONTEND_DOMAIN SlackClientId=$SLACK_CLIENT_ID SlackClientSecret=$SLACK_CLIENT_SECRET SlackSigningSecret=$SLACK_SIGNING_SECRET GroqApiKey=$GROQ_API_KEY"
+          if [ -n "$API_DOMAIN" ]; then
+            PARAMS="$PARAMS ApiDomain=$API_DOMAIN"
+          fi
+
           aws cloudformation deploy \
             --stack-name "$STACK_NAME" \
             --template-file "$TEMPLATE_FILE" \
             --capabilities CAPABILITY_NAMED_IAM \
             --region "$AWS_REGION" \
             --no-fail-on-empty-changeset \
-            --parameter-overrides \
-              Env="$ENV_NAME" \
-              ImageTag="$IMAGE_TAG" \
-              ApiDomain="$API_DOMAIN" \
-              FrontendDomain="$FRONTEND_DOMAIN" \
-              SlackClientId="$SLACK_CLIENT_ID" \
-              SlackClientSecret="$SLACK_CLIENT_SECRET" \
-              SlackSigningSecret="$SLACK_SIGNING_SECRET" \
-              GroqApiKey="$GROQ_API_KEY"
+            --parameter-overrides $PARAMS
 
       - name: Read stack outputs
         shell: bash
