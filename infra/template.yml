@@ -159,20 +159,44 @@ Resources:
           SESSIONS_TABLE: !Ref SessionsTable
           ENV: !Ref Env
 
-  SlackbotFunctionUrl:
-    Type: AWS::Lambda::Url
+  # -------------------------
+  # API GATEWAY HTTP API
+  # -------------------------
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
     Properties:
-      TargetFunctionArn: !Ref SlackbotFunction
-      AuthType: NONE
-      InvokeMode: BUFFERED
+      Name: !Sub "${Env}-slackbot-http-api"
+      ProtocolType: HTTP
 
-  SlackbotFunctionUrlPermission:
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt SlackbotFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  HttpApiDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "$default"
+      Target: !Sub "integrations/${HttpApiIntegration}"
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  HttpApiLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref SlackbotFunction
-      Action: lambda:InvokeFunctionUrl
-      Principal: "*"
-      FunctionUrlAuthType: NONE
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
 
   # -------------------------
   # S3 BUCKET
@@ -216,7 +240,7 @@ Resources:
             OriginAccessControlId: !Ref FrontendOAC
 
           - Id: apigw-origin
-            DomainName: !Select [2, !Split ["/", !GetAtt SlackbotFunctionUrl.FunctionUrl]]
+            DomainName: !Sub "${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
             OriginPath: ""
             CustomOriginConfig:
               OriginProtocolPolicy: https-only
@@ -308,3 +332,6 @@ Outputs:
 
   DynamoDBTableName:
     Value: !Ref MessagesTable
+
+  ApiUrl:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
