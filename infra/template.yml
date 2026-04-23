@@ -138,12 +138,13 @@ Resources:
 
   PostgresDB:
     Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
     Properties:
       DBName: !Ref DBName
       AllocatedStorage: 20
       DBInstanceClass: db.t4g.micro
       Engine: postgres
-      EngineVersion: '15.4' # Typical stable PG version
+      EngineVersion: '15'
       MasterUsername: !Ref DBUser
       MasterUserPassword: !Ref DBPassword
       DBSubnetGroupName: !Ref DBSubnetGroup
@@ -151,9 +152,8 @@ Resources:
         - !GetAtt RDSSecurityGroup.GroupId
       PubliclyAccessible: true
       StorageType: gp3
-      BackupRetentionPeriod: 0 # Disable backups for dev to save costs
+      BackupRetentionPeriod: 0
       StorageEncrypted: true
-      DeletionPolicy: Snapshot
 
   # -------------------------
   # IAM ROLE FOR LAMBDA
