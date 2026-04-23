@@ -9,17 +9,13 @@ from typing import Optional
 import boto3
 import requests
 from botocore.exceptions import ClientError
-from boto3.dynamodb.conditions import Key
 from fastapi import HTTPException, Response
 
-from app.constants import AWS_REGION, SECRET_PREFIX, DDB_TABLE, SESSIONS_TABLE, SLACK_API_BASE
+from app.constants import AWS_REGION, SECRET_PREFIX, SLACK_API_BASE
 from app.logger import logger
 
 # ── AWS CLIENTS ───────────────────────────────────────────────────────────────
 secrets_client = boto3.client("secretsmanager", region_name=AWS_REGION)
-dynamodb       = boto3.resource("dynamodb", region_name=AWS_REGION)
-ddb_table      = dynamodb.Table(DDB_TABLE)      if DDB_TABLE      else None
-sessions_table = dynamodb.Table(SESSIONS_TABLE) if SESSIONS_TABLE else None
 
 
 # ── HTTP HELPERS ──────────────────────────────────────────────────────────────
@@ -80,11 +76,7 @@ def verify_slack_signature(signing_secret: str, timestamp: str, body: bytes, sig
     return hmac.compare_digest("v0=" + digest, signature)
 
 
-# ── DDB GUARD ─────────────────────────────────────────────────────────────────
-
-def require_ddb():
-    if ddb_table is None:
-        raise HTTPException(500, "DDB_TABLE environment variable is not set")
+# ── DDB GUARD (REMOVED) ────────────────────────────────────────────────────────
 
 
 # ── DATE / TIMESTAMP HELPERS ──────────────────────────────────────────────────
@@ -131,35 +123,32 @@ def _validate_channel_id(v: str) -> str:
 
 
 # ── USER CACHE ────────────────────────────────────────────────────────────────
-# pk = "{team_id}#__users__",  sk = user_id
-# Stores display_name + real_name so we can look up user_id by username.
-
-def _user_pk(team_id: str) -> str:
-    return f"{team_id}#__users__"
-
 
 def get_cached_user(team_id: str, user_id: str) -> Optional[dict]:
-    if ddb_table is None:
-        return None
     try:
-        resp = ddb_table.get_item(Key={"pk": _user_pk(team_id), "sk": user_id})
-        return resp.get("Item")
+        from app.db import get_conn
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id, display_name, real_name FROM users_cache WHERE team_id = %s AND user_id = %s",
+                    (team_id, user_id)
+                )
+                res = cur.fetchone()
+                return dict(res) if res else None
     except Exception:
         return None
 
-
 def upsert_cached_user(team_id: str, user_id: str, display_name: str, real_name: str) -> None:
-    if ddb_table is None:
-        return
     try:
-        ddb_table.put_item(Item={
-            "pk":           _user_pk(team_id),
-            "sk":           user_id,
-            "user_id":      user_id,
-            "display_name": display_name,
-            "real_name":    real_name,
-            "cached_at":    datetime.utcnow().isoformat() + "Z",
-        })
+        from app.db import get_conn
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO users_cache (team_id, user_id, display_name, real_name)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (team_id, user_id) 
+                    DO UPDATE SET display_name = EXCLUDED.display_name, real_name = EXCLUDED.real_name, cached_at = CURRENT_TIMESTAMP
+                """, (team_id, user_id, display_name, real_name))
     except Exception as e:
         logger.warning(f"[user-cache] upsert failed for {user_id}: {e}")
 
@@ -177,17 +166,19 @@ def resolve_user_id(team_id: str, username: str, bot_token: str) -> Optional[str
     needle = username.strip().lower()
 
     # ── 1. Check cache ────────────────────────────────────────────────────────
-    if ddb_table is not None:
-        try:
-            resp = ddb_table.query(KeyConditionExpression=Key("pk").eq(_user_pk(team_id)))
-            for item in resp.get("Items", []):
-                dn = (item.get("display_name") or "").lower()
-                rn = (item.get("real_name")    or "").lower()
-                if needle in dn or needle in rn or dn.startswith(needle) or rn.startswith(needle):
-                    logger.info(f"[user-cache] resolved '{username}' \u2192 {item['user_id']} (cache hit)")
-                    return item["user_id"]
-        except Exception as e:
-            logger.warning(f"[user-cache] cache query failed: {e}")
+    try:
+        from app.db import get_conn
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id, display_name, real_name FROM users_cache WHERE team_id = %s", (team_id,))
+                for item in cur.fetchall():
+                    dn = (item.get("display_name") or "").lower()
+                    rn = (item.get("real_name")    or "").lower()
+                    if needle in dn or needle in rn or dn.startswith(needle) or rn.startswith(needle):
+                        logger.info(f"[user-cache] resolved '{username}' \u2192 {item['user_id']} (cache hit)")
+                        return item["user_id"]
+    except Exception as e:
+        logger.warning(f"[user-cache] cache query failed: {e}")
 
     # ── 2. Fetch from Slack and populate cache ────────────────────────────────
     logger.info(f"[user-cache] cache miss for '{username}', fetching users.list from Slack")

@@ -13,13 +13,13 @@ from urllib.parse import urlencode
 
 from app.constants import (
     CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, SLACK_SCOPES, SLACK_SIGNING_SECRET,
-    FRONTEND_PATH, SESSION_COOKIE_NAME, AWS_REGION, DDB_TABLE, SESSIONS_TABLE,
+    FRONTEND_PATH, SESSION_COOKIE_NAME, AWS_REGION,
     MAX_BODY_BYTES, MAX_TOKENS_SINGLE, MAX_TOKENS_MULTI, SLACK_API_BASE, SLACK_OAUTH_BASE,
 )
 from app.logger import logger
 from app.utils import (
     no_cache, secret_name, read_secret, upsert_secret, mask_token,
-    verify_slack_signature, require_ddb, ddb_table, secrets_client,
+    verify_slack_signature, secrets_client,
     resolve_username_for_message, extract_username_from_question,
 )
 from app.session import (
@@ -54,7 +54,6 @@ def health(response: Response):
     no_cache(response)
     return {
         "status": "ok", "region": AWS_REGION,
-        "ddb_table": DDB_TABLE, "sessions_table": SESSIONS_TABLE,
         "client_id_present": bool(CLIENT_ID),
     }
 
@@ -296,7 +295,6 @@ def join_all_public(team_id: str, request: Request):
 @router.post("/backfill-channel")
 @router.post("/api/backfill-channel")
 def backfill_channel(team_id: str, channel_id: str, request: Request, limit: int = 200, cursor: str | None = None):
-    require_ddb()
     require_team_access(request, team_id)
     sec = read_secret(secret_name(team_id))
     if not sec or not sec.get("bot_token"):
@@ -309,29 +307,40 @@ def backfill_channel(team_id: str, channel_id: str, request: Request, limit: int
                         params=params, timeout=20).json()
     if not data.get("ok"):
         return {"ok": False, "slack_error": data}
-    msgs = data.get("messages", []) or []
-    pk   = f"{team_id}#{channel_id}"
-    stored = 0
-    for m in msgs:
-        ts_msg = str(m.get("ts"))
-        if not ts_msg:
-            continue
-        uid      = m.get("user")
-        username = resolve_username_for_message(team_id, uid, sec["bot_token"]) if uid else ""
-        item = {
-            "pk": pk, "sk": ts_msg,
-            "team_id": team_id, "channel_id": channel_id, "ts": ts_msg,
-            "user_id": uid, "username": username, "text": m.get("text", ""),
-            "thread_ts": m.get("thread_ts"), "reply_count": m.get("reply_count", 0),
-            "subtype": m.get("subtype"), "type": m.get("type"),
-            "fetched_at": datetime.utcnow().isoformat() + "Z",
-        }
-        try:
-            ddb_table.put_item(Item=item, ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)")
-            stored += 1
-        except ClientError as e:
-            if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
-                raise
+        
+    try:
+        from app.db import get_conn
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                msgs = data.get("messages", []) or []
+                pk   = f"{team_id}#{channel_id}"
+                stored = 0
+                for m in msgs:
+                    ts_msg = str(m.get("ts"))
+                    if not ts_msg:
+                        continue
+                    uid      = m.get("user")
+                    username = resolve_username_for_message(team_id, uid, sec["bot_token"]) if uid else ""
+                    
+                    try:
+                        cur.execute(
+                            """
+                            INSERT INTO messages (pk, sk, ts, user_id, username, text, channel_id, team_id, subtype)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (pk, sk) DO NOTHING
+                            """,
+                            (pk, ts_msg, ts_msg, uid, username, m.get("text", ""), channel_id, team_id, m.get("subtype"))
+                        )
+                        # rowcount tells us if a row was actually inserted or skipped due to DO NOTHING
+                        if cur.rowcount > 0:
+                            stored += 1
+                    except Exception as e:
+                        logger.warning(f"Failed to insert message during backfill: {e}")
+                
+    except Exception as e:
+        logger.error(f"Backfill DB connection error: {e}")
+        return {"ok": False, "error": str(e)}
+
     next_cursor = (data.get("response_metadata") or {}).get("next_cursor") or ""
     return {"ok": True, "channel_id": channel_id, "fetched": len(msgs),
             "stored_new": stored, "next_cursor": next_cursor, "has_more": bool(next_cursor)}
@@ -342,7 +351,6 @@ def backfill_channel(team_id: str, channel_id: str, request: Request, limit: int
 @router.post("/backfill-all-public")
 @router.post("/api/backfill-all-public")
 def backfill_all_public(team_id: str, request: Request):
-    require_ddb()
     require_team_access(request, team_id)
     sec = read_secret(secret_name(team_id))
     if not sec or not sec.get("bot_token"):
@@ -387,7 +395,6 @@ def backfill_all_public(team_id: str, request: Request):
 @router.post("/backfill-all-private")
 @router.post("/api/backfill-all-private")
 def backfill_all_private(team_id: str, request: Request):
-    require_ddb()
     require_team_access(request, team_id)
     sec = read_secret(secret_name(team_id))
     if not sec or not sec.get("bot_token"):
@@ -452,12 +459,17 @@ async def slack_events(request: Request):
 def db_messages(team_id: str, channel_id: str, request: Request, limit: int = 50, response: Response = None):
     if response is not None:
         no_cache(response)
-    require_ddb()
     require_team_access(request, team_id)
     try:
-        resp = ddb_table.query(KeyConditionExpression=Key("pk").eq(f"{team_id}#{channel_id}"),
-                               Limit=limit, ScanIndexForward=False)
-        return {"ok": True, "count": resp.get("Count", 0), "items": resp.get("Items", [])}
+        from app.db import get_conn
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM messages WHERE team_id = %s AND channel_id = %s ORDER BY sk DESC LIMIT %s",
+                    (team_id, channel_id, limit)
+                )
+                items = [dict(row) for row in cur.fetchall()]
+        return {"ok": True, "count": len(items), "items": items}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 

@@ -1,9 +1,7 @@
 import re
 from typing import Optional
 
-from boto3.dynamodb.conditions import Key, Attr
-
-from app.utils import ddb_table, _date_to_sk, _ts_human, require_ddb, resolve_user_id
+from app.utils import _date_to_sk, _ts_human, resolve_user_id
 from app.constants import CONTEXT_MAX_CHARS
 from app.logger import logger
 
@@ -116,36 +114,36 @@ def retrieve_messages(
     limit: int = 200, top_k: int = 10,
     username: Optional[str] = None, bot_token: Optional[str] = None,
 ) -> list[dict]:
-    require_ddb()
+    query = "SELECT * FROM messages WHERE team_id = %s AND channel_id = %s"
+    params = [team_id, channel_id]
 
-    if username and not user_id and bot_token:
-        resolved = resolve_user_id(team_id, username, bot_token)
-        if resolved:
-            user_id = resolved
-        else:
-            logger.info(f"[retrieve] username '{username}' not found in workspace {team_id}")
-            return []
-
-    pk       = f"{team_id}#{channel_id}"
-    key_expr = Key("pk").eq(pk)
     if from_date and to_date:
-        key_expr = key_expr & Key("sk").between(_date_to_sk(from_date), _date_to_sk(to_date, end_of_day=True))
+        query += " AND sk BETWEEN %s AND %s"
+        params.extend([_date_to_sk(from_date), _date_to_sk(to_date, end_of_day=True)])
     elif from_date:
-        key_expr = key_expr & Key("sk").gte(_date_to_sk(from_date))
+        query += " AND sk >= %s"
+        params.append(_date_to_sk(from_date))
     elif to_date:
-        key_expr = key_expr & Key("sk").lte(_date_to_sk(to_date, end_of_day=True))
+        query += " AND sk <= %s"
+        params.append(_date_to_sk(to_date, end_of_day=True))
 
-    # Oldest-first for chrono queries, newest-first otherwise
-    scan_forward = _is_chrono_query(q)
-    kwargs = {"KeyConditionExpression": key_expr, "Limit": limit, "ScanIndexForward": scan_forward}
     if user_id:
-        kwargs["FilterExpression"] = Attr("user_id").eq(user_id)
+        query += " AND user_id = %s"
+        params.append(user_id)
+
+    scan_forward = _is_chrono_query(q)
+    query += " ORDER BY sk " + ("ASC" if scan_forward else "DESC")
+    query += " LIMIT %s"
+    params.append(limit)
 
     try:
-        response = ddb_table.query(**kwargs)
-        items    = response.get("Items", [])
+        from app.db import get_conn
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, tuple(params))
+                items = [dict(row) for row in cur.fetchall()]
     except Exception as e:
-        raise RuntimeError(f"DynamoDB query failed: {e}")
+        raise RuntimeError(f"PostgreSQL query failed: {e}")
 
     # Filter out system join/leave messages
     items = [i for i in items if i.get("subtype") not in ("channel_join", "channel_leave")]
@@ -191,29 +189,43 @@ def retrieve_messages_multi(
     scan_forward = _is_chrono_query(q)
     all_raw: list[dict] = []
 
-    for channel_id in channel_ids:
-        pk       = f"{team_id}#{channel_id}"
-        key_expr = Key("pk").eq(pk)
-        if from_date and to_date:
-            key_expr = key_expr & Key("sk").between(_date_to_sk(from_date), _date_to_sk(to_date, end_of_day=True))
-        elif from_date:
-            key_expr = key_expr & Key("sk").gte(_date_to_sk(from_date))
-        elif to_date:
-            key_expr = key_expr & Key("sk").lte(_date_to_sk(to_date, end_of_day=True))
+    if not channel_ids:
+        return []
 
-        kwargs = {"KeyConditionExpression": key_expr, "Limit": limit, "ScanIndexForward": scan_forward}
-        if user_id:
-            kwargs["FilterExpression"] = Attr("user_id").eq(user_id)
+    query = "SELECT * FROM messages WHERE team_id = %s AND channel_id = ANY(%s)"
+    params = [team_id, channel_ids]
 
-        try:
-            resp  = ddb_table.query(**kwargs)
-            items = resp.get("Items", [])
-            items = [i for i in items if i.get("subtype") not in ("channel_join", "channel_leave")]
-            items = [i for i in items if not re.search(
-                r"<@\w+> has (joined|left)", (i.get("text") or "").lower())]
-            all_raw.extend(items)
-        except Exception as e:
-            logger.warning(f"[retrieve_multi] DDB query failed for {channel_id}: {e}")
+    if from_date and to_date:
+        query += " AND sk BETWEEN %s AND %s"
+        params.extend([_date_to_sk(from_date), _date_to_sk(to_date, end_of_day=True)])
+    elif from_date:
+        query += " AND sk >= %s"
+        params.append(_date_to_sk(from_date))
+    elif to_date:
+        query += " AND sk <= %s"
+        params.append(_date_to_sk(to_date, end_of_day=True))
+
+    if user_id:
+        query += " AND user_id = %s"
+        params.append(user_id)
+
+    # We enforce limit on the unified query, though sorting occurs later
+    query += " ORDER BY sk " + ("ASC" if scan_forward else "DESC")
+    query += " LIMIT %s"
+    params.append(limit * len(channel_ids))
+
+    try:
+        from app.db import get_conn
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, tuple(params))
+                items = [dict(row) for row in cur.fetchall()]
+                items = [i for i in items if i.get("subtype") not in ("channel_join", "channel_leave")]
+                items = [i for i in items if not re.search(
+                    r"<@\w+> has (joined|left)", (i.get("text") or "").lower())]
+                all_raw.extend(items)
+    except Exception as e:
+        logger.warning(f"[retrieve_multi] PostgreSQL query failed: {e}")
 
     if not all_raw:
         return []

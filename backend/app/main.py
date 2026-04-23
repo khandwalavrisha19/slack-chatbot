@@ -10,7 +10,15 @@ from app.logger import logger
 from app.constants import CORS_ORIGINS
 from app.routes import router
 
-app = FastAPI(title="Slackbot AI Modular")
+from contextlib import asynccontextmanager
+from app.db import init_db
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+app = FastAPI(title="Slackbot AI Modular", lifespan=lifespan)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 origins = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()] if CORS_ORIGINS else []

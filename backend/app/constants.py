@@ -24,8 +24,11 @@ SLACK_SCOPES         = os.getenv(
 ).strip()
 CORS_ORIGINS         = os.getenv("CORS_ORIGINS", "*")
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "").strip()
-DDB_TABLE            = os.getenv("DDB_TABLE", "").strip()
-SESSIONS_TABLE       = os.getenv("SESSIONS_TABLE", "slackbot_sessions").strip()
+DB_HOST              = os.getenv("DB_HOST", "localhost").strip()
+DB_USER              = os.getenv("DB_USER", "postgres").strip()
+DB_PASSWORD          = os.getenv("DB_PASSWORD", "postgres").strip()
+DB_NAME              = os.getenv("DB_NAME", "slackbotdb").strip()
+DB_PORT              = int(os.getenv("DB_PORT", "5432").strip())
 BEDROCK_MODEL_ID     = os.getenv("BEDROCK_MODEL_ID", "meta.llama3-1-70b-instruct-v1:0").strip()
 UI_BASE_URL          = os.getenv("UI_BASE_URL", "").rstrip("/")
 SESSION_COOKIE_NAME  = "sb_session"

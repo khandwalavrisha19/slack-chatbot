@@ -5,8 +5,6 @@ import requests
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Optional
-from boto3.dynamodb.conditions import Key, Attr
-from botocore.exceptions import ClientError
 from mangum import Mangum
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
@@ -16,8 +14,13 @@ from app.constants import (
     SLACK_SIGNING_SECRET, MAX_BODY_BYTES, RATE_WINDOW_SECS,
     MAX_CHANNEL_IDS, MAX_TOKENS_BOT, MAX_TOKENS_SINGLE, MAX_TOKENS_MULTI
 )
+from app.logger import logger
+from app.constants import (
+    SLACK_SIGNING_SECRET, MAX_BODY_BYTES, RATE_WINDOW_SECS,
+    MAX_CHANNEL_IDS, MAX_TOKENS_BOT, MAX_TOKENS_SINGLE, MAX_TOKENS_MULTI
+)
 from app.utils import (
-    ddb_table, require_ddb, read_secret, secret_name,
+    read_secret, secret_name,
     verify_slack_signature, resolve_username_for_message,
     resolve_user_id, extract_username_from_question
 )
@@ -141,15 +144,15 @@ def _resolve_channel_id_by_name(bot_token: str, channel_name: str) -> Optional[s
     return None
 
 def _get_all_bot_channel_ids(team_id: str) -> list[str]:
-    if ddb_table is None: return []
     try:
-        resp = ddb_table.scan(FilterExpression=Attr("team_id").eq(team_id), ProjectionExpression="pk")
-        pks = {item["pk"] for item in resp.get("Items", [])}
-        prefix = f"{team_id}#"
-        ids = [pk[len(prefix):] for pk in pks
-               if pk.startswith(prefix) and not pk.endswith("__users__")
-               and not pk[len(prefix):].startswith("D")]
-        return ids[:MAX_CHANNEL_IDS]
+        from app.db import get_conn
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT DISTINCT channel_id FROM messages WHERE team_id = %s LIMIT %s",
+                    (team_id, MAX_CHANNEL_IDS)
+                )
+                return [row["channel_id"] for row in cur.fetchall()]
     except Exception as e:
         logger.warning("Failed to list all channel IDs", extra={"error": str(e)})
         return []
@@ -264,16 +267,20 @@ async def handle_slack_event(payload: dict, raw_body: bytes, timestamp: str, sig
     # Store message if not DM
     if event.get("channel_type") != "im":
         username = resolve_username_for_message(team_id, uid, bot_token) if bot_token else ""
-        item = {
-            "pk": f"{team_id}#{channel_id}", "sk": str(ts_msg),
-            "team_id": team_id, "channel_id": channel_id, "ts": str(ts_msg),
-            "user_id": uid, "username": username, "text": event.get("text", ""),
-            "thread_ts": event.get("thread_ts"), "type": event.get("type"),
-            "fetched_at": datetime.utcnow().isoformat() + "Z",
-        }
-        try: ddb_table.put_item(Item=item, ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)")
-        except ClientError as e:
-            if e.response["Error"]["Code"] != "ConditionalCheckFailedException": raise
+        try:
+            from app.db import get_conn
+            with get_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO messages (pk, sk, ts, user_id, username, text, channel_id, team_id, subtype)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (pk, sk) DO NOTHING
+                        """,
+                        (f"{team_id}#{channel_id}", str(ts_msg), str(ts_msg), uid, username, event.get("text", ""), channel_id, team_id, event.get("subtype"))
+                    )
+        except Exception as e:
+            logger.error(f"PostgreSQL PutItem failed: {e}")
 
     # Handle bot reply
     is_mention = event.get("type") == "app_mention"
