@@ -395,7 +395,17 @@ Outputs:
   LambdaName:
     Value: !Ref SlackbotFunction
 
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
 
+  CloudFrontDistributionId:
+    Value: !Ref FrontendDistribution
+
+  CloudFrontDomain:
+    Value: !GetAtt FrontendDistribution.DomainName
+
+  RDSEndpoint:
+    Value: !GetAtt PostgresDB.Endpoint.Address
 
   ApiUrl:
     Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
