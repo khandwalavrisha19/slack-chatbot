@@ -26,9 +26,7 @@ CORS_ORIGINS         = os.getenv("CORS_ORIGINS", "*")
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "").strip()
 DDB_TABLE            = os.getenv("DDB_TABLE", "").strip()
 SESSIONS_TABLE       = os.getenv("SESSIONS_TABLE", "slackbot_sessions").strip()
-GROQ_API_KEY         = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL           = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile").strip()
-GROQ_URL             = "https://api.groq.com/openai/v1/chat/completions"
+BEDROCK_MODEL_ID     = os.getenv("BEDROCK_MODEL_ID", "meta.llama3-1-70b-instruct-v1:0").strip()
 UI_BASE_URL          = os.getenv("UI_BASE_URL", "").rstrip("/")
 SESSION_COOKIE_NAME  = "sb_session"
 SESSION_TTL_HOURS    = 72
@@ -39,8 +37,6 @@ _frontend_default = Path(__file__).with_name("index.html")
 FRONTEND_PATH     = Path(os.getenv("FRONTEND_PATH", str(_frontend_default)))
 
 # ── GROQ TIMEOUTS & TOKEN LIMITS ─────────────────────────────────────────────
-GROQ_TIMEOUT_CONNECT = 5    # seconds to establish connection
-GROQ_TIMEOUT_READ    = 30   # seconds to read response
 CONTEXT_MAX_CHARS    = 8_000
 MAX_TOKENS_SINGLE    = 768
 MAX_TOKENS_MULTI     = 900

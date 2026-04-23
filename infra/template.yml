@@ -27,10 +27,10 @@ Parameters:
     Type: String
     NoEcho: true
 
-  GroqApiKey:
+  BedrockModelId:
     Type: String
-    NoEcho: true
-    Default: ""
+    Description: "Bedrock Model ID to use (e.g. meta.llama3-1-70b-instruct-v1:0)"
+    Default: "meta.llama3-1-70b-instruct-v1:0"
 
 
 Resources:
@@ -119,6 +119,16 @@ Resources:
                   - !GetAtt MessagesTable.Arn
                   - !GetAtt SessionsTable.Arn
 
+        - PolicyName: !Sub "${Env}-slackbot-bedrock"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/*"
+
         - PolicyName: !Sub "${Env}-slackbot-secrets"
           PolicyDocument:
             Version: "2012-10-17"
@@ -154,7 +164,7 @@ Resources:
           SLACK_CLIENT_SECRET: !Ref SlackClientSecret
           SLACK_SIGNING_SECRET: !Ref SlackSigningSecret
           SLACK_REDIRECT_URI: !Sub "https://${FrontendDomain}/api/oauth/callback"
-          GROQ_API_KEY: !Ref GroqApiKey
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
           SLACK_SCOPES: "channels:read,groups:read,channels:history,groups:history,im:history,mpim:history,users:read,chat:write,channels:join,app_mentions:read"
           SESSIONS_TABLE: !Ref SessionsTable
           ENV: !Ref Env

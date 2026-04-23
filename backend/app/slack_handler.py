@@ -26,7 +26,7 @@ from app.retrieval import (
     _build_context, _augment_question_with_senders,
     _format_messages, _is_recency_query
 )
-from app.groq_client import _groq_complete
+from app.bedrock_client import _bedrock_complete
 
 # ── SLACK EVENTS WEBHOOK ──────────────────────────────────────────────────────
 
@@ -207,7 +207,7 @@ def _handle_bot_message(
             return
         context, _ = _build_context(messages, channel_prefix=search_all)
         system_prompt = "Summarize the provided Slack messages concisely with bullets. Use Slack markdown."
-        answer = _groq_complete(f"Summarize:\n{context}", MAX_TOKENS_BOT, system=system_prompt)
+        answer = _bedrock_complete(f"Summarize:\n{context}", MAX_TOKENS_BOT, system=system_prompt)
         _post_slack_message(bot_token, dm_channel, f"*Summary*:\n\n{answer}", thread_ts)
         return
 
@@ -236,7 +236,7 @@ def _handle_bot_message(
     system_prompt = "You are a helpful Slack assistant. Answer ONLY from provided messages. Cite like [1]."
     convo_history = _get_thread_history(bot_token, dm_channel, thread_ts)
     augmented_q   = _augment_question_with_senders(query, messages)
-    answer = _groq_complete(f"CONTEXT:\n{context}\n\nQUESTION: {augmented_q}", MAX_TOKENS_BOT, system=system_prompt, conversation_history=convo_history)
+    answer = _bedrock_complete(f"CONTEXT:\n{context}\n\nQUESTION: {augmented_q}", MAX_TOKENS_BOT, system=system_prompt, conversation_history=convo_history)
     _post_slack_message(bot_token, dm_channel, answer, thread_ts)
 
 async def handle_slack_event(payload: dict, raw_body: bytes, timestamp: str, signature: str):

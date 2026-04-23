@@ -30,7 +30,7 @@ from app.retrieval import (
     retrieve_messages, retrieve_messages_multi,
     _build_context, _augment_question_with_senders,
 )
-from app.groq_client import _groq_complete
+from app.bedrock_client import _bedrock_complete
 from app.models import ChatRequest, MultiChatRequest
 from app.slack_handler import handle_slack_event
 
@@ -590,7 +590,7 @@ def api_chat(body: ChatRequest, request: Request, response: Response):
     )
     augmented_q = _augment_question_with_senders(body.question, messages)
     user_prompt  = f"SLACK MESSAGES:\n{context}\n\nQUESTION: {augmented_q}"
-    answer_text  = _groq_complete(user_prompt, MAX_TOKENS_SINGLE, system=system_prompt)
+    answer_text  = _bedrock_complete(user_prompt, MAX_TOKENS_SINGLE, system=system_prompt)
     cited_indices = [int(n)-1 for n in re.findall(r"\[(\d+)\]", answer_text)
                      if n.isdigit() and 0 < int(n) <= len(messages)]
     citations     = [messages[i] for i in dict.fromkeys(cited_indices)]
@@ -654,7 +654,7 @@ def api_chat_multi(body: MultiChatRequest, request: Request, response: Response)
     )
     augmented_q = _augment_question_with_senders(body.question, messages)
     user_prompt  = f"SLACK MESSAGES:\n{context}\n\nQUESTION: {augmented_q}"
-    answer_text  = _groq_complete(user_prompt, MAX_TOKENS_MULTI, system=system_prompt)
+    answer_text  = _bedrock_complete(user_prompt, MAX_TOKENS_MULTI, system=system_prompt)
     cited_indices = [int(n)-1 for n in re.findall(r"\[(\d+)\]", answer_text)
                      if n.isdigit() and 0 < int(n) <= len(messages)]
     citations     = [messages[i] for i in dict.fromkeys(cited_indices)]
