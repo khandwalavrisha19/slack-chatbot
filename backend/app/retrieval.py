@@ -156,18 +156,21 @@ def retrieve_messages(
     if _is_chrono_query(q) or _is_recency_query(q):
         return _format_messages(items[:top_k])
 
-    # No meaningful keywords → return top items
-    if not _content_keywords(q):
+    content_kws = _content_keywords(q)
+
+    # ── Case 1: Username only (no keyword) → return all their messages newest-first
+    if user_id and not content_kws:
         return _format_messages(items[:top_k])
 
-    # User filter already applied server-side → just slice
-    if user_id:
-        return _format_messages(items[:top_k])
+    # ── Case 2: Keyword only (no username) → score all messages by keyword relevance
+    # ── Case 3: Keyword + Username → score that user's messages by keyword relevance
+    if content_kws:
+        scored = _score_messages(items, q)[:top_k]
+        scored.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
+        return _format_messages(scored)
 
-    # Score by keyword relevance, then re-sort matched results newest-first
-    scored = _score_messages(items, q)[:top_k]
-    scored.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
-    return _format_messages(scored)
+    # Fallback: no keywords, no user — return top items
+    return _format_messages(items[:top_k])
 
 
 def retrieve_messages_multi(
@@ -223,13 +226,22 @@ def retrieve_messages_multi(
         )
         return _format_messages(all_raw[:top_k])
 
-    # No meaningful keywords or user-filtered — sort newest-first and slice
-    if not _content_keywords(q) or user_id:
+    content_kws = _content_keywords(q)
+
+    # ── Case 1: Username only (no keyword) → return all their messages newest-first
+    if user_id and not content_kws:
         all_raw.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
         return _format_messages(all_raw[:top_k])
 
-    # Score by keyword relevance
-    return _format_messages(_score_messages(all_raw, q)[:top_k])
+    # ── Case 2: Keyword only → score all messages by keyword relevance
+    # ── Case 3: Keyword + Username → DynamoDB already filtered by user_id,
+    #            now score those user's messages by keyword relevance
+    if content_kws:
+        return _format_messages(_score_messages(all_raw, q)[:top_k])
+
+    # Fallback: no keywords, no user — return top items newest-first
+    all_raw.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
+    return _format_messages(all_raw[:top_k])
 
 
 # ── CONTEXT / PROMPT BUILDERS ─────────────────────────────────────────────────
