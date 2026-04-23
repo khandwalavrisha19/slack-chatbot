@@ -20,6 +20,8 @@ _RECENCY_WORDS = frozenset([
     # stop words
     "about", "said", "say", "says", "did", "does", "from",
     "the", "and", "for", "with", "its", "this", "that", "tell",
+    "summarize", "summary", "messages", "channel", "chat",
+    "conversation", "please", "give", "me", "of", "a", "all", "can", "you",
 ])
 
 
