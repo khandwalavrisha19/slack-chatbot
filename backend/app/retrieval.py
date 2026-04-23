@@ -3,9 +3,9 @@ from typing import Optional
 
 from boto3.dynamodb.conditions import Key, Attr
 
+from app.utils import ddb_table, _date_to_sk, _ts_human, require_ddb, resolve_user_id
 from app.constants import CONTEXT_MAX_CHARS
 from app.logger import logger
-from app.utils import ddb_table, _date_to_sk, _ts_human, require_ddb, resolve_user_id
 
 
 # ── RECENCY / KEYWORD HELPERS ─────────────────────────────────────────────────
@@ -17,20 +17,36 @@ _RECENCY_WORDS = frozenset([
     "next", "week", "soon", "tomorrow", "upcoming", "future",
     # question words
     "what", "who", "whose", "whom", "where", "when", "why", "how",
-    # stop words
-    "about", "said", "say", "says", "did", "does", "from",
-    "the", "and", "for", "with", "its", "this", "that", "tell",
-    "summarize", "summary", "messages", "channel", "chat",
-    "conversation", "please", "give", "me", "of", "a", "all", "can", "you",
+    # dashboard meta-words and common query verbs (ignore for keyword matching)
+    "channel", "channels", "message", "messages", "bot", "slack",
+    "sent", "was", "has", "had", "been", "from", "and", "the", "for",
+    "about", "said", "say", "says", "did", "does", "with", "its", "this", "that", "tell",
+    "summarize", "summary", "chat", "conversation", "please", "give", "me", "of",
+    "a", "all", "can", "you",
+])
+
+_CHRONO_WORDS = frozenset([
+    "first", "oldest", "start", "beginning", "earliest", "origin",
 ])
 
 
 def _is_recency_query(q: str) -> bool:
+    if not q:
+        return False
     words = set(re.findall(r"\w+", q.lower()))
     return bool(words & _RECENCY_WORDS)
 
 
+def _is_chrono_query(q: str) -> bool:
+    if not q:
+        return False
+    words = set(re.findall(r"\w+", q.lower()))
+    return bool(words & _CHRONO_WORDS)
+
+
 def _content_keywords(q: str) -> list[str]:
+    if not q:
+        return []
     return [w for w in re.findall(r"\w+", q.lower())
             if w not in _RECENCY_WORDS and len(w) > 2]
 
@@ -63,8 +79,11 @@ def _score_messages(items: list[dict], q: str) -> list[dict]:
     scored.sort(key=lambda x: x[0], reverse=True)
     result = [item for score, item in scored if score > 0]
 
-    if _is_recency_query(q) and result:
-        result.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
+    if result:
+        if _is_chrono_query(q):
+            result.sort(key=lambda m: m.get("sk") or m.get("ts") or "")
+        elif _is_recency_query(q):
+            result.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
 
     return result
 
@@ -116,26 +135,39 @@ def retrieve_messages(
     elif to_date:
         key_expr = key_expr & Key("sk").lte(_date_to_sk(to_date, end_of_day=True))
 
-    kwargs = {"KeyConditionExpression": key_expr, "Limit": limit, "ScanIndexForward": False}
+    # Oldest-first for chrono queries, newest-first otherwise
+    scan_forward = _is_chrono_query(q)
+    kwargs = {"KeyConditionExpression": key_expr, "Limit": limit, "ScanIndexForward": scan_forward}
     if user_id:
         kwargs["FilterExpression"] = Attr("user_id").eq(user_id)
+
     try:
         response = ddb_table.query(**kwargs)
         items    = response.get("Items", [])
     except Exception as e:
         raise RuntimeError(f"DynamoDB query failed: {e}")
 
+    # Filter out system join/leave messages
+    items = [i for i in items if i.get("subtype") not in ("channel_join", "channel_leave")]
     items = [i for i in items if not re.search(r"<@\w+> has (joined|left)", (i.get("text") or "").lower())]
 
-    if not q or not q.strip():
+    # For temporal / recency queries, bypass keyword scoring entirely —
+    # the correct chronological context is already fetched from DynamoDB.
+    if _is_chrono_query(q) or _is_recency_query(q):
         return _format_messages(items[:top_k])
+
+    # No meaningful keywords → return top items
     if not _content_keywords(q):
         return _format_messages(items[:top_k])
+
+    # User filter already applied server-side → just slice
     if user_id:
         return _format_messages(items[:top_k])
 
-    matched = _score_messages(items, q)
-    return _format_messages(matched[:top_k])
+    # Score by keyword relevance, then re-sort matched results newest-first
+    scored = _score_messages(items, q)[:top_k]
+    scored.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
+    return _format_messages(scored)
 
 
 def retrieve_messages_multi(
@@ -153,7 +185,9 @@ def retrieve_messages_multi(
             logger.info(f"[retrieve_multi] username '{username}' not found in workspace {team_id}")
             return []
 
+    scan_forward = _is_chrono_query(q)
     all_raw: list[dict] = []
+
     for channel_id in channel_ids:
         pk       = f"{team_id}#{channel_id}"
         key_expr = Key("pk").eq(pk)
@@ -164,12 +198,14 @@ def retrieve_messages_multi(
         elif to_date:
             key_expr = key_expr & Key("sk").lte(_date_to_sk(to_date, end_of_day=True))
 
-        kwargs = {"KeyConditionExpression": key_expr, "Limit": limit, "ScanIndexForward": False}
+        kwargs = {"KeyConditionExpression": key_expr, "Limit": limit, "ScanIndexForward": scan_forward}
         if user_id:
             kwargs["FilterExpression"] = Attr("user_id").eq(user_id)
+
         try:
             resp  = ddb_table.query(**kwargs)
             items = resp.get("Items", [])
+            items = [i for i in items if i.get("subtype") not in ("channel_join", "channel_leave")]
             items = [i for i in items if not re.search(
                 r"<@\w+> has (joined|left)", (i.get("text") or "").lower())]
             all_raw.extend(items)
@@ -179,37 +215,21 @@ def retrieve_messages_multi(
     if not all_raw:
         return []
 
-    if user_id:
+    # Temporal / chrono queries — bypass keyword scoring
+    if _is_chrono_query(q) or _is_recency_query(q):
+        all_raw.sort(
+            key=lambda m: m.get("sk") or m.get("ts") or "",
+            reverse=not _is_chrono_query(q),
+        )
+        return _format_messages(all_raw[:top_k])
+
+    # No meaningful keywords or user-filtered — sort newest-first and slice
+    if not _content_keywords(q) or user_id:
         all_raw.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
         return _format_messages(all_raw[:top_k])
 
-    content_kws = _content_keywords(q) if q and q.strip() else []
-
-    if content_kws:
-        scored_pool = []
-        for item in all_raw:
-            text   = (item.get("text") or "").lower()
-            score  = sum(text.count(kw) for kw in content_kws)
-            score += sum(2 for kw in content_kws if kw in text[:80])
-            if len(content_kws) > 1 and " ".join(content_kws) in text:
-                score += 5
-            if len(text) > 800:
-                score = score * 800 / len(text)
-            if len(text) < 20:
-                score *= 0.5
-            if score > 0:
-                scored_pool.append((score, item))
-
-        scored_pool.sort(key=lambda x: x[0], reverse=True)
-        if _is_recency_query(q):
-            scored_pool.sort(key=lambda x: x[1].get("sk") or x[1].get("ts") or "", reverse=True)
-
-        top_items = [item for _, item in scored_pool[:top_k]]
-    else:
-        all_raw.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
-        top_items = all_raw[:top_k]
-
-    return _format_messages(top_items)
+    # Score by keyword relevance
+    return _format_messages(_score_messages(all_raw, q)[:top_k])
 
 
 # ── CONTEXT / PROMPT BUILDERS ─────────────────────────────────────────────────
