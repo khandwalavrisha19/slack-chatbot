@@ -114,8 +114,17 @@ def retrieve_messages(
     limit: int = 200, top_k: int = 10,
     username: Optional[str] = None, bot_token: Optional[str] = None,
 ) -> list[dict]:
+    # ── Resolve display-name → Slack user_id ──────────────────────────────────
+    if username and not user_id and bot_token:
+        resolved = resolve_user_id(team_id, username, bot_token)
+        if resolved:
+            user_id = resolved
+            logger.info(f"[retrieve] resolved username '{username}' → {user_id}")
+        else:
+            logger.info(f"[retrieve] username '{username}' not found — falling back to username column match")
+
     query = "SELECT * FROM messages WHERE team_id = %s AND channel_id = %s"
-    params = [team_id, channel_id]
+    params: list = [team_id, channel_id]
 
     if from_date and to_date:
         query += " AND sk BETWEEN %s AND %s"
@@ -128,8 +137,13 @@ def retrieve_messages(
         params.append(_date_to_sk(to_date, end_of_day=True))
 
     if user_id:
+        # Filter by Slack user_id (most precise)
         query += " AND user_id = %s"
         params.append(user_id)
+    elif username:
+        # Fallback: match stored display name (case-insensitive, partial match)
+        query += " AND username ILIKE %s"
+        params.append(f"%{username.strip()}%")
 
     scan_forward = _is_chrono_query(q)
     query += " ORDER BY sk " + ("ASC" if scan_forward else "DESC")
@@ -149,19 +163,18 @@ def retrieve_messages(
     items = [i for i in items if i.get("subtype") not in ("channel_join", "channel_leave")]
     items = [i for i in items if not re.search(r"<@\w+> has (joined|left)", (i.get("text") or "").lower())]
 
-    # For temporal / recency queries, bypass keyword scoring entirely —
-    # the correct chronological context is already fetched from DynamoDB.
+    # For temporal / recency queries, bypass keyword scoring
     if _is_chrono_query(q) or _is_recency_query(q):
         return _format_messages(items[:top_k])
 
     content_kws = _content_keywords(q)
+    has_user_filter = bool(user_id or username)
 
-    # ── Case 1: Username only (no keyword) → return all their messages newest-first
-    if user_id and not content_kws:
+    # ── Case 1: Username only (no keyword) → return their messages newest-first
+    if has_user_filter and not content_kws:
         return _format_messages(items[:top_k])
 
-    # ── Case 2: Keyword only (no username) → score all messages by keyword relevance
-    # ── Case 3: Keyword + Username → score that user's messages by keyword relevance
+    # ── Case 2/3: Keyword (± username already filtered in SQL) → score by relevance
     if content_kws:
         scored = _score_messages(items, q)[:top_k]
         scored.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
@@ -193,7 +206,7 @@ def retrieve_messages_multi(
         return []
 
     query = "SELECT * FROM messages WHERE team_id = %s AND channel_id = ANY(%s)"
-    params = [team_id, channel_ids]
+    params: list = [team_id, channel_ids]
 
     if from_date and to_date:
         query += " AND sk BETWEEN %s AND %s"
@@ -208,6 +221,9 @@ def retrieve_messages_multi(
     if user_id:
         query += " AND user_id = %s"
         params.append(user_id)
+    elif username:
+        query += " AND username ILIKE %s"
+        params.append(f"%{username.strip()}%")
 
     # We enforce limit on the unified query, though sorting occurs later
     query += " ORDER BY sk " + ("ASC" if scan_forward else "DESC")
