@@ -29,7 +29,7 @@ DB_USER              = os.getenv("DB_USER", "postgres").strip()
 DB_PASSWORD          = os.getenv("DB_PASSWORD", "postgres").strip()
 DB_NAME              = os.getenv("DB_NAME", "slackbotdb").strip()
 DB_PORT              = int(os.getenv("DB_PORT", "5432").strip())
-BEDROCK_MODEL_ID     = os.getenv("BEDROCK_MODEL_ID", "meta.llama3-1-70b-instruct-v1:0").strip()
+BEDROCK_MODEL_ID     = os.getenv("BEDROCK_MODEL_ID", "meta.llama3-8b-instruct-v1:0").strip()
 UI_BASE_URL          = os.getenv("UI_BASE_URL", "").rstrip("/")
 SESSION_COOKIE_NAME  = "sb_session"
 SESSION_TTL_HOURS    = 72
@@ -39,11 +39,11 @@ IS_PROD              = os.getenv("ENV", "dev").strip().lower() == "prod"
 _frontend_default = Path(__file__).with_name("index.html")
 FRONTEND_PATH     = Path(os.getenv("FRONTEND_PATH", str(_frontend_default)))
 
-# ── GROQ TIMEOUTS & TOKEN LIMITS ─────────────────────────────────────────────
-CONTEXT_MAX_CHARS    = 8_000
-MAX_TOKENS_SINGLE    = 768
-MAX_TOKENS_MULTI     = 900
-MAX_TOKENS_BOT       = 600
+# ── BEDROCK TOKEN LIMITS ─────────────────────────────────────────────────────
+CONTEXT_MAX_CHARS    = 5_000   # Reduced from 8000 → fewer input tokens → faster
+MAX_TOKENS_SINGLE    = 512    # Reduced from 768 → faster single-channel answers
+MAX_TOKENS_MULTI     = 600    # Reduced from 900 → faster multi-channel answers
+MAX_TOKENS_BOT       = 450    # Reduced from 600 → faster bot DM replies
 RATE_WINDOW_SECS     = 60
 
 # ── CORS ORIGINS (parsed) ─────────────────────────────────────────────────────
