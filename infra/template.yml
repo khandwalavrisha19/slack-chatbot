@@ -14,7 +14,7 @@ Parameters:
   FrontendDomain:
     Type: String
     Description: "CloudFront domain (leave blank on first deploy, update after)"
-    Default: ""
+    Default: "d7yqw1hafu45p.cloudfront.net"
 
   SlackClientId:
     Type: String
