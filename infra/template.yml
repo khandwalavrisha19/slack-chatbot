@@ -237,6 +237,28 @@ Resources:
           ENV: !Ref Env
 
   # -------------------------
+  # LAMBDA KEEP-WARM (prevents cold starts)
+  # Pings Lambda every 5 minutes so it stays loaded in memory
+  # -------------------------
+  WarmUpRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Env}-slackbot-warmup"
+      ScheduleExpression: "rate(5 minutes)"
+      State: ENABLED
+      Targets:
+        - Id: WarmUpTarget
+          Arn: !GetAtt SlackbotFunction.Arn
+
+  WarmUpPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SlackbotFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WarmUpRule.Arn
+
+  # -------------------------
   # API GATEWAY HTTP API
   # -------------------------
   HttpApi:

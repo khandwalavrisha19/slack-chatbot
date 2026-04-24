@@ -9,13 +9,16 @@ from mangum import Mangum
 from app.logger import logger
 from app.constants import CORS_ORIGINS
 from app.routes import router
-
-from contextlib import asynccontextmanager
 from app.db import init_db
+from contextlib import asynccontextmanager
+
+import threading
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
+    # Run schema init in a background thread so it doesn't block
+    # the first request during Lambda cold start
+    threading.Thread(target=init_db, daemon=True).start()
     yield
 
 app = FastAPI(title="Slackbot AI Modular", lifespan=lifespan)
@@ -43,4 +46,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 app.include_router(router)
 
 # ── LAMBDA HANDLER ────────────────────────────────────────────────────────────
-handler = Mangum(app)
+handler = Mangum(app, lifespan="on")
+
+# ── KEEP-WARM PING HANDLER ────────────────────────────────────────────────────
+# CloudWatch Events calls Lambda directly (not via HTTP) with a scheduled event.
+# Mangum wraps HTTP only, so we intercept the raw Lambda event here.
+_http_handler = handler
+
+def handler(event, context):  # noqa: F811 — intentional override
+    # CloudWatch scheduled warm-up ping — return immediately without processing
+    if event.get("source") == "aws.events" or event.get("detail-type") == "Scheduled Event":
+        return {"statusCode": 200, "body": "warm"}
+    return _http_handler(event, context)
