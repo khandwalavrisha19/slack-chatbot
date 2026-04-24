@@ -270,28 +270,39 @@ def extract_username_from_question(
       1. Slack-encoded: <@U12345>  → resolved to display_name via API
       2. Plain text:    @vrisha    → returned as-is for resolve_user_id later
 
-    Returns the display name string, or None if no mention found.
+    IMPORTANT: If the question mentions multiple users (e.g. "by @alice and @bob"),
+    returns None so the retrieval isn't filtered to just the first match —
+    the AI will see messages from all users and answer about both.
+
+    Returns the display name string, or None if no mention / multiple mentions found.
     """
     if not question:
         return None
 
-    # ── 1. Slack-encoded mention <@USERID> ────────────────────────────────────
-    encoded = _SLACK_ENCODED_MENTION.search(question)
-    if encoded:
-        uid = encoded.group(1)
+    # ── Check for multiple Slack-encoded mentions <@USERID> ──────────────────
+    encoded_all = _SLACK_ENCODED_MENTION.findall(question)
+    if len(encoded_all) > 1:
+        logger.info(f"[name-extract] multiple encoded mentions found ({encoded_all}) — skipping user filter")
+        return None
+
+    if len(encoded_all) == 1:
+        uid = encoded_all[0]
         if team_id and bot_token:
             name = resolve_username_for_message(team_id, uid, bot_token)
             if name and name != uid:
                 logger.info(f"[name-extract] <@{uid}> resolved to display name '{name}'")
                 return name
-        # If we can't resolve, return the raw uid so resolve_user_id can try by uid directly
         logger.info(f"[name-extract] <@{uid}> found but could not resolve display name")
         return uid
 
-    # ── 2. Plain @name mention ────────────────────────────────────────────────
-    m = _AT_MENTION.search(question)
-    if m:
-        name = m.group(1).strip()
+    # ── Check for multiple plain @name mentions ───────────────────────────────
+    at_all = _AT_MENTION.findall(question)
+    if len(at_all) > 1:
+        logger.info(f"[name-extract] multiple @mentions found ({at_all}) — skipping user filter so AI can answer about all users")
+        return None
+
+    if len(at_all) == 1:
+        name = at_all[0].strip()
         logger.info(f"[name-extract] @mention extracted '{name}' from question: {question!r}")
         return name
 
