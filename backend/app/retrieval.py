@@ -123,6 +123,10 @@ def retrieve_messages(
         else:
             logger.info(f"[retrieve] username '{username}' not found — falling back to username column match")
 
+    content_kws = _content_keywords(q)
+    has_user_filter = bool(user_id or username)
+    scan_forward = _is_chrono_query(q)
+
     query = "SELECT * FROM messages WHERE team_id = %s AND channel_id = %s"
     params: list = [team_id, channel_id]
 
@@ -137,18 +141,26 @@ def retrieve_messages(
         params.append(_date_to_sk(to_date, end_of_day=True))
 
     if user_id:
-        # Filter by Slack user_id (most precise)
         query += " AND user_id = %s"
         params.append(user_id)
     elif username:
-        # Fallback: match stored display name (case-insensitive, partial match)
         query += " AND username ILIKE %s"
         params.append(f"%{username.strip()}%")
 
-    scan_forward = _is_chrono_query(q)
+    # ── KEY OPTIMIZATION: filter by keyword IN SQL, not Python ───────────────
+    # Instead of fetching 200 rows and scoring in Python, let Postgres do it.
+    if content_kws and not _is_chrono_query(q) and not _is_recency_query(q):
+        kw_conditions = " OR ".join(["text ILIKE %s" for _ in content_kws])
+        query += f" AND ({kw_conditions})"
+        params.extend([f"%{kw}%" for kw in content_kws])
+        # Smaller fetch when keyword pre-filtered
+        fetch_limit = min(top_k * 4, 60)
+    else:
+        fetch_limit = limit
+
     query += " ORDER BY sk " + ("ASC" if scan_forward else "DESC")
     query += " LIMIT %s"
-    params.append(limit)
+    params.append(fetch_limit)
 
     try:
         from app.db import get_conn
@@ -159,28 +171,23 @@ def retrieve_messages(
     except Exception as e:
         raise RuntimeError(f"PostgreSQL query failed: {e}")
 
-    # Filter out system join/leave messages
+    # Filter system join/leave messages
     items = [i for i in items if i.get("subtype") not in ("channel_join", "channel_leave")]
     items = [i for i in items if not re.search(r"<@\w+> has (joined|left)", (i.get("text") or "").lower())]
 
-    # For temporal / recency queries, bypass keyword scoring
     if _is_chrono_query(q) or _is_recency_query(q):
         return _format_messages(items[:top_k])
 
-    content_kws = _content_keywords(q)
-    has_user_filter = bool(user_id or username)
-
-    # ── Case 1: Username only (no keyword) → return their messages newest-first
+    # Case 1: User only (no keyword)
     if has_user_filter and not content_kws:
         return _format_messages(items[:top_k])
 
-    # ── Case 2/3: Keyword (± username already filtered in SQL) → score by relevance
+    # Case 2/3: Keyword scoring on the already pre-filtered small set
     if content_kws:
         scored = _score_messages(items, q)[:top_k]
         scored.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
         return _format_messages(scored)
 
-    # Fallback: no keywords, no user — return top items
     return _format_messages(items[:top_k])
 
 
@@ -199,11 +206,11 @@ def retrieve_messages_multi(
             logger.info(f"[retrieve_multi] username '{username}' not found in workspace {team_id}")
             return []
 
-    scan_forward = _is_chrono_query(q)
-    all_raw: list[dict] = []
-
     if not channel_ids:
         return []
+
+    content_kws = _content_keywords(q)
+    scan_forward = _is_chrono_query(q)
 
     query = "SELECT * FROM messages WHERE team_id = %s AND channel_id = ANY(%s)"
     params: list = [team_id, channel_ids]
@@ -225,11 +232,24 @@ def retrieve_messages_multi(
         query += " AND username ILIKE %s"
         params.append(f"%{username.strip()}%")
 
-    # We enforce limit on the unified query, though sorting occurs later
+    # ── KEY OPTIMIZATION: keyword pre-filtering in SQL for multi-channel ───────
+    # Without this, 5 channels × 200 rows = 1000 rows fetched, all scored in Python.
+    # With this, only rows containing the keyword are fetched.
+    if content_kws and not _is_chrono_query(q) and not _is_recency_query(q):
+        kw_conditions = " OR ".join(["text ILIKE %s" for _ in content_kws])
+        query += f" AND ({kw_conditions})"
+        params.extend([f"%{kw}%" for kw in content_kws])
+        # Cap at top_k * 5 rows max when keyword-filtered
+        fetch_limit = min(top_k * 5, 100)
+    else:
+        # No keyword — just get recent messages, cap per-channel
+        fetch_limit = min(limit, 50) * len(channel_ids)
+
     query += " ORDER BY sk " + ("ASC" if scan_forward else "DESC")
     query += " LIMIT %s"
-    params.append(limit * len(channel_ids))
+    params.append(fetch_limit)
 
+    all_raw: list[dict] = []
     try:
         from app.db import get_conn
         with get_conn() as conn:
@@ -254,10 +274,9 @@ def retrieve_messages_multi(
         )
         return _format_messages(all_raw[:top_k])
 
-    content_kws = _content_keywords(q)
-
     # ── Case 1: Username only (no keyword) → return all their messages newest-first
-    if user_id and not content_kws:
+    has_user_filter = bool(user_id or username)
+    if has_user_filter and not content_kws:
         all_raw.sort(key=lambda m: m.get("sk") or m.get("ts") or "", reverse=True)
         return _format_messages(all_raw[:top_k])
 
