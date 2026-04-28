@@ -193,7 +193,7 @@ Resources:
                   - bedrock:InvokeModelWithResponseStream
                 Resource: 
                   - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/*"
-                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:*:inference-profile/*"
 
         - PolicyName: !Sub "${Env}-slackbot-secrets"
           PolicyDocument:
