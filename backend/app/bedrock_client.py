@@ -129,7 +129,7 @@ def _bedrock_complete(
             return "⚠️ The AI service is currently rate-limited. Please wait a few seconds and try again."
         elif code == "AccessDeniedException":
             logger.error("Bedrock access denied", extra={"request_id": request_id, "error": msg})
-            return "⚠️ AWS Bedrock Model Access is missing. Please enable Claude 3 Haiku access in AWS Console → Bedrock → Model Access."
+            return f"⚠️ AWS Bedrock Model Access is missing. Please enable access to '{BEDROCK_MODEL_ID}' in AWS Console → Bedrock → Model Access."
         else:
             logger.error("Bedrock ClientError", extra={"request_id": request_id, "error_code": code, "error": msg})
             return "⚠️ Could not reach the AI service. Please try again."
