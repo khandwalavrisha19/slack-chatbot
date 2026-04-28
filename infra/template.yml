@@ -29,8 +29,8 @@ Parameters:
 
   BedrockModelId:
     Type: String
-    Description: "Bedrock Model ID to use (e.g. meta.llama3-1-70b-instruct-v1:0)"
-    Default: "meta.llama3-1-70b-instruct-v1:0"
+    Description: "Bedrock Model ID to use (e.g. anthropic.claude-3-haiku-20240307-v1:0)"
+    Default: "anthropic.claude-3-haiku-20240307-v1:0"
 
   DBUser:
     Type: String
