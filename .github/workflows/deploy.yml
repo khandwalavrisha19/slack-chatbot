@@ -120,7 +120,7 @@ jobs:
         shell: bash
         run: |
           # Conditionally build parameters string to support Prod's ApiDomain requirement
-          PARAMS="Env=$ENV_NAME ImageTag=$IMAGE_TAG FrontendDomain=$FRONTEND_DOMAIN SlackClientId=$SLACK_CLIENT_ID SlackClientSecret=$SLACK_CLIENT_SECRET SlackSigningSecret=$SLACK_SIGNING_SECRET DBPassword=${{ secrets.DB_PASSWORD }}"
+          PARAMS="Env=$ENV_NAME ImageTag=$IMAGE_TAG FrontendDomain=$FRONTEND_DOMAIN SlackClientId=$SLACK_CLIENT_ID SlackClientSecret=$SLACK_CLIENT_SECRET SlackSigningSecret=$SLACK_SIGNING_SECRET DBPassword=${{ secrets.DB_PASSWORD }} BedrockModelId=us.meta.llama3-3-70b-instruct-v1:0"
           if [ -n "$API_DOMAIN" ]; then
             PARAMS="$PARAMS ApiDomain=$API_DOMAIN"
           fi
