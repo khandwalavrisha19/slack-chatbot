@@ -19,7 +19,7 @@ This tool lets you search and ask AI-powered questions about your Slack message 
 
 ### Step 1 — Open the App
 
-Go to: **https://d2586s68tp0zxo.cloudfront.net/**
+Go to: **https://d7yqw1hafu45p.cloudfront.net/**
 
 ---
 
