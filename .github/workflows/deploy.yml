@@ -161,12 +161,11 @@ jobs:
       - name: Upload frontend to S3
         shell: bash
         run: |
-          test -f frontend/index.html || { echo "frontend/index.html not found"; exit 1; }
+          test -d frontend || { echo "frontend directory not found"; exit 1; }
 
-          aws s3 cp frontend/index.html "s3://$FRONTEND_BUCKET/index.html" \
+          aws s3 sync frontend/ "s3://$FRONTEND_BUCKET/" \
             --region "$AWS_REGION" \
-            --cache-control "public,max-age=0,must-revalidate" \
-            --content-type "text/html"
+            --cache-control "public,max-age=0,must-revalidate"
 
       - name: Invalidate CloudFront cache
         shell: bash
